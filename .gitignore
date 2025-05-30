@@ -1,0 +1,34 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Node
+node_modules/
+
+# VSCode
+.vscode/
+
+# Environment files
+.env
+.env.*
+
+# Logs
+*.log
+
+# Editor swap/backup
+*.swp
+*.tmp
+
+# System
+Thumbs.db
+.idea/
+
+# Build output
+dist/
+build/
+coverage/
