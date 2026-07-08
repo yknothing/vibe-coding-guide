@@ -67,9 +67,25 @@ python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.p
 ```
 
 JSON output is a stable wrapper with `schema_version`, `status`, `timestamp`,
-`scanned_files`, `skipped_files`, `rules_loaded`, `issues`, `tool_errors`, and
-`summary`. Individual `issues` keep the required fields from
+`scanned_files`, `skipped_files`, `rules_loaded`, `metrics`, `ratchet`,
+`issues`, `tool_errors`, and `summary`. Individual `issues` keep the required fields from
 `for-ai/rules/issue.schema.json`.
+
+## Quality Ratchet
+
+Use a previous JSON report as the baseline for touched-file metrics:
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --format json \
+  --ratchet-baseline previous-report.json \
+  --files path/to/file.py
+```
+
+The ratchet compares only files present in both the baseline and the current
+scan. New files do not fail for missing history. The current metrics cover
+magic numeric literals, hardcoded endpoints, and maximum Python function complexity.
+This is the APOSD_03 "must not regress" slice; it does not claim that every
+green turn must produce a refactoring diff.
 
 Validate the split rule sources:
 

@@ -254,6 +254,8 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 "scanned_files",
                 "skipped_files",
                 "rules_loaded",
+                "metrics",
+                "ratchet",
                 "issues",
                 "tool_errors",
                 "summary",
@@ -263,7 +265,9 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(payload["status"], "fail")
             self.assertEqual(payload["scanned_files"], ["bad.py"])
             self.assertEqual(set(payload["rules_loaded"]), {"IMP_004", "IMP_007", "MNT_001"})
+            self.assertEqual(payload["ratchet"]["status"], "not_configured")
             self.assertEqual(payload["summary"]["issue_count"], len(payload["issues"]))
+            self.assertEqual(payload["summary"]["ratchet_violation_count"], 0)
             self.assertGreaterEqual(len(payload["issues"]), 1)
             issue = payload["issues"][0]
             for field in [
@@ -315,6 +319,137 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertGreater(len(payload["issues"]), 1)
             self.assertEqual(payload["summary"]["issue_count"], len(payload["issues"]))
+
+    def test_ratchet_baseline_fails_when_touched_file_complexity_regresses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "route.py"
+            target.write_text(
+                textwrap.dedent(
+                    """
+                    def route(status, retries):
+                        if status:
+                            return "retry"
+                        if retries:
+                            return "escalate"
+                        return "ok"
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            baseline = workspace / "baseline.json"
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "quality-gate-report/v1",
+                        "metrics": {
+                            "files": {
+                                "route.py": {
+                                    "python_max_cyclomatic_complexity": 2,
+                                    "python_total_cyclomatic_complexity": 2,
+                                    "magic_literal_count": 0,
+                                    "hardcoded_endpoint_count": 0,
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--format",
+                    "json",
+                    "--complexity-threshold",
+                    "10",
+                    "--ratchet-baseline",
+                    str(baseline),
+                    "--files",
+                    str(target),
+                ],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["issues"], [])
+            self.assertEqual(payload["status"], "fail")
+            self.assertEqual(payload["ratchet"]["status"], "fail")
+            self.assertEqual(payload["summary"]["ratchet_violation_count"], 1)
+            metrics = {violation["metric"] for violation in payload["ratchet"]["violations"]}
+            self.assertEqual(metrics, {"python_max_cyclomatic_complexity"})
+
+    def test_ratchet_allows_total_complexity_growth_when_max_complexity_does_not_regress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "steps.py"
+            target.write_text(
+                textwrap.dedent(
+                    """
+                    def first(flag):
+                        if flag:
+                            return "yes"
+                        return "no"
+
+                    def second(flag):
+                        if flag:
+                            return "yes"
+                        return "no"
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            baseline = workspace / "baseline.json"
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "quality-gate-report/v1",
+                        "metrics": {
+                            "files": {
+                                "steps.py": {
+                                    "python_max_cyclomatic_complexity": 2,
+                                    "python_total_cyclomatic_complexity": 2,
+                                    "magic_literal_count": 0,
+                                    "hardcoded_endpoint_count": 0,
+                                }
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--format",
+                    "json",
+                    "--complexity-threshold",
+                    "10",
+                    "--ratchet-baseline",
+                    str(baseline),
+                    "--files",
+                    str(target),
+                ],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["ratchet"]["status"], "pass")
+            self.assertEqual(payload["summary"]["ratchet_violation_count"], 0)
 
     def test_hook_json_output_uses_rule_metadata_for_complexity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

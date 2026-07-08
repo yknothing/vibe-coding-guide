@@ -31,6 +31,12 @@ TOOL_TIMEOUT_SECONDS = 30
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
 DEFAULT_COMPLEXITY_THRESHOLD = 10
 DEFAULT_MAX_ISSUES = 25
+MAX_TOTAL_METRICS = {"python_max_cyclomatic_complexity"}
+RATCHET_METRICS = {
+    "hardcoded_endpoint_count",
+    "magic_literal_count",
+    "python_max_cyclomatic_complexity",
+}
 
 PYTHON_EXTENSIONS = {".py"}
 JS_TS_EXTENSIONS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
@@ -109,6 +115,15 @@ class SkippedFile:
     reason: str
 
 
+@dataclasses.dataclass(frozen=True)
+class RatchetViolation:
+    file_path: str
+    metric: str
+    baseline: int
+    current: int
+    message: str
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scan PostToolUse-edited files for magic values and complexity."
@@ -156,6 +171,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("VCG_MAX_ISSUES", DEFAULT_MAX_ISSUES)),
         help="Maximum issue count to print in text feedback.",
+    )
+    parser.add_argument(
+        "--ratchet-baseline",
+        type=Path,
+        default=None,
+        help="Optional previous JSON report whose touched-file metrics must not regress.",
     )
     return parser.parse_args(argv)
 
@@ -524,6 +545,141 @@ def scan_python_complexity_builtin(path: Path, root: Path, threshold: int) -> li
     return visitor.issues
 
 
+def python_complexity_metrics(path: Path) -> dict[str, int]:
+    metrics = {
+        "python_function_count": 0,
+        "python_max_cyclomatic_complexity": 0,
+        "python_total_cyclomatic_complexity": 0,
+    }
+    if path.suffix not in PYTHON_EXTENSIONS:
+        return metrics
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        return metrics
+
+    complexities = [
+        python_cyclomatic_complexity(node)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if not complexities:
+        return metrics
+    return {
+        "python_function_count": len(complexities),
+        "python_max_cyclomatic_complexity": max(complexities),
+        "python_total_cyclomatic_complexity": sum(complexities),
+    }
+
+
+def collect_quality_metrics(files: list[Path], root: Path) -> dict[str, Any]:
+    file_metrics: dict[str, dict[str, int]] = {}
+    totals: dict[str, int] = {}
+    for path in files:
+        rel = relative_path(path, root)
+        literal_issues = scan_magic_values_builtin(path, root)
+        metrics = {
+            "magic_literal_count": sum(1 for issue in literal_issues if issue.rule_id == "IMP_004"),
+            "hardcoded_endpoint_count": sum(1 for issue in literal_issues if issue.rule_id == "MNT_001"),
+            **python_complexity_metrics(path),
+        }
+        file_metrics[rel] = metrics
+        merge_quality_totals(totals, metrics)
+
+    return {
+        "files": file_metrics,
+        "totals": dict(sorted(totals.items())),
+    }
+
+
+def merge_quality_totals(totals: dict[str, int], metrics: dict[str, int]) -> None:
+    for metric, value in metrics.items():
+        if metric in MAX_TOTAL_METRICS:
+            totals[metric] = max(totals.get(metric, 0), value)
+        else:
+            totals[metric] = totals.get(metric, 0) + value
+
+
+def load_baseline_metrics(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path}: unable to read ratchet baseline: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: ratchet baseline must be a JSON object")
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict) or not isinstance(metrics.get("files"), dict):
+        raise ValueError(f"{path}: ratchet baseline must include metrics.files")
+    return metrics
+
+
+def ratchet_violation_for_metric(
+    file_path: str,
+    metric: str,
+    current_value: int,
+    baseline_file: dict[str, Any],
+) -> RatchetViolation | None:
+    baseline_value = baseline_file.get(metric)
+    if not isinstance(baseline_value, int):
+        return None
+    if current_value <= baseline_value:
+        return None
+    return RatchetViolation(
+        file_path=file_path,
+        metric=metric,
+        baseline=baseline_value,
+        current=current_value,
+        message=(
+            f"{metric} regressed from {baseline_value} to {current_value} "
+            f"for touched file {file_path}."
+        ),
+    )
+
+
+def ratchet_violations_for_file(
+    file_path: str,
+    metrics: dict[str, int],
+    baseline_files: dict[str, Any],
+) -> list[RatchetViolation]:
+    baseline_file = baseline_files.get(file_path)
+    if not isinstance(baseline_file, dict):
+        return []
+    violations = []
+    for metric, current_value in metrics.items():
+        if metric not in RATCHET_METRICS:
+            continue
+        violation = ratchet_violation_for_metric(file_path, metric, current_value, baseline_file)
+        if violation is not None:
+            violations.append(violation)
+    return violations
+
+
+def evaluate_ratchet(
+    current_metrics: dict[str, Any], baseline_path: Path | None
+) -> tuple[dict[str, Any], list[ToolError]]:
+    if baseline_path is None:
+        return {"status": "not_configured", "violations": []}, []
+    try:
+        baseline_metrics = load_baseline_metrics(baseline_path)
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "baseline": str(baseline_path),
+            "violations": [],
+        }, [ToolError("quality-ratchet", str(exc))]
+
+    violations: list[RatchetViolation] = []
+    baseline_files = baseline_metrics["files"]
+    for file_path, metrics in current_metrics["files"].items():
+        violations.extend(ratchet_violations_for_file(file_path, metrics, baseline_files))
+
+    return {
+        "status": "fail" if violations else "pass",
+        "baseline": str(baseline_path),
+        "violations": [dataclasses.asdict(violation) for violation in violations],
+    }, []
+
+
 def run_ruff(files: list[Path], root: Path, require_tools: bool) -> tuple[list[Issue], list[ToolError], bool]:
     python_files = [path for path in files if path.suffix in PYTHON_EXTENSIONS]
     if not python_files:
@@ -784,12 +940,25 @@ def scan_files(
     return dedupe_issues(issues), tool_errors
 
 
-def render_feedback(issues: list[Issue], tool_errors: list[ToolError], max_issues: int) -> str:
+def render_feedback(
+    issues: list[Issue],
+    tool_errors: list[ToolError],
+    ratchet: dict[str, Any],
+    max_issues: int,
+) -> str:
     lines: list[str] = []
     if tool_errors:
         lines.append("Quality gate setup failed:")
         for error in tool_errors:
             lines.append(f"- {error.tool}: {error.message}")
+    ratchet_violations = ratchet.get("violations", [])
+    if ratchet_violations:
+        lines.append(f"Quality ratchet found {len(ratchet_violations)} regression(s):")
+        for violation in ratchet_violations[:max_issues]:
+            lines.append(
+                f"- {violation['file_path']}: {violation['metric']} "
+                f"{violation['baseline']} -> {violation['current']}"
+            )
     if issues:
         lines.append(f"Quality gate found {len(issues)} issue(s):")
         for issue in issues[:max_issues]:
@@ -816,8 +985,11 @@ def build_report(
     skipped_files: list[SkippedFile],
     root: Path,
     rules: dict[str, Rule],
+    metrics: dict[str, Any],
+    ratchet: dict[str, Any],
 ) -> dict[str, Any]:
-    status = "error" if tool_errors else "fail" if issues else "pass"
+    ratchet_violations = ratchet.get("violations", [])
+    status = "error" if tool_errors else "fail" if issues or ratchet_violations else "pass"
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "gate": "post_tool_use_quality_gate",
@@ -828,11 +1000,14 @@ def build_report(
         "scanned_files": [relative_path(path, root) for path in files],
         "skipped_files": [dataclasses.asdict(skipped) for skipped in skipped_files],
         "rules_loaded": sorted(rules),
+        "metrics": metrics,
+        "ratchet": ratchet,
         "issues": [issue.to_schema() for issue in issues],
         "tool_errors": [dataclasses.asdict(error) for error in tool_errors],
         "summary": {
             "issue_count": len(issues),
             "tool_error_count": len(tool_errors),
+            "ratchet_violation_count": len(ratchet_violations),
             "scanned_file_count": len(files),
             "skipped_file_count": len(skipped_files),
         },
@@ -867,8 +1042,10 @@ def main(argv: list[str]) -> int:
         input_errors.append(ToolError("hook-input", "No --files provided and --hook was not set."))
         files = []
 
+    metrics = collect_quality_metrics(files, root)
+    ratchet, ratchet_errors = evaluate_ratchet(metrics, args.ratchet_baseline)
     issues, tool_errors = scan_files(files, root, args.complexity_threshold, args.require_tools)
-    all_errors = [*input_errors, *rule_errors, *tool_errors]
+    all_errors = [*input_errors, *rule_errors, *tool_errors, *ratchet_errors]
     if rules:
         missing_issue_rules = sorted({issue.rule_id for issue in issues} - set(rules))
         if missing_issue_rules:
@@ -881,11 +1058,17 @@ def main(argv: list[str]) -> int:
         issues = apply_rule_metadata(issues, rules)
 
     if args.format == "json":
-        print(json.dumps(build_report(issues, all_errors, files, skipped_files, root, rules), ensure_ascii=False, indent=2))
-    elif issues or all_errors:
-        print(render_feedback(issues, all_errors, args.max_issues), file=sys.stderr)
+        print(
+            json.dumps(
+                build_report(issues, all_errors, files, skipped_files, root, rules, metrics, ratchet),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif issues or all_errors or ratchet.get("violations"):
+        print(render_feedback(issues, all_errors, ratchet, args.max_issues), file=sys.stderr)
 
-    if issues or all_errors:
+    if issues or all_errors or ratchet.get("violations"):
         return 2 if args.hook else 1
     return 0
 

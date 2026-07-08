@@ -52,9 +52,12 @@ tools/                        规则加载、校验与 APOSD_02a 复杂度仪表
 python3 -m unittest discover -s tests -v
 python3 tools/validate_rules.py rules --require IMP_004 --require IMP_007 --require MNT_001
 python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.py
+python3 hooks/post_tool_use_quality_gate.py --format json --ratchet-baseline previous-report.json --files path/to/file.py
 ```
 
-项目级 hook 配置、strict 模式依赖和手工 payload 模拟见 [hooks/README.md](./hooks/README.md)。
+JSON 输出包含 `metrics` 与 `ratchet` 字段，可作为 `APOSD_03` 的最小回合级棘轮：
+传入上一轮 baseline 后，触碰文件的魔法值、硬编码端点和最大 Python 函数复杂度不得劣化。
+项目级 hook 配置、strict 模式依赖、棘轮 baseline 和手工 payload 模拟见 [hooks/README.md](./hooks/README.md)。
 
 ## 复杂度仪表盘原型
 
