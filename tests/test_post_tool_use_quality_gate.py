@@ -164,6 +164,62 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertIn("MNT_001", result.stderr)
             self.assertIn("endpoint.py", result.stderr)
 
+    def test_public_python_api_without_docstring_reports_documentation_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "api.py"
+            target.write_text(
+                textwrap.dedent(
+                    """
+                    __all__ = ["public_api"]
+
+                    def public_api(value):
+                        return value
+
+                    def _private_helper(value):
+                        return value
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(HOOK), "--format", "json", "--files", str(target)],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            payload = json.loads(result.stdout)
+            doc_issues = [issue for issue in payload["issues"] if issue["rule_id"] == "MNT_002"]
+            self.assertEqual(len(doc_issues), 1)
+            self.assertEqual(doc_issues[0]["file_path"], "api.py")
+            self.assertIn("public_api", doc_issues[0]["message"])
+
+    def test_private_python_helper_without_docstring_passes_documentation_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "helpers.py"
+            target.write_text(
+                "def _private_helper(value):\n    return value\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(HOOK), "--format", "json", "--files", str(target)],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["issues"], [])
+
     def test_constant_defined_hardcoded_url_still_reports_configuration_issue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -264,7 +320,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(payload["gate"], "post_tool_use_quality_gate")
             self.assertEqual(payload["status"], "fail")
             self.assertEqual(payload["scanned_files"], ["bad.py"])
-            self.assertEqual(set(payload["rules_loaded"]), {"IMP_004", "IMP_007", "MNT_001"})
+            self.assertEqual(set(payload["rules_loaded"]), {"IMP_004", "IMP_007", "MNT_001", "MNT_002"})
             self.assertEqual(payload["ratchet"]["status"], "not_configured")
             self.assertEqual(payload["summary"]["issue_count"], len(payload["issues"]))
             self.assertEqual(payload["summary"]["ratchet_violation_count"], 0)

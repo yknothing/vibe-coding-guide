@@ -1,0 +1,12 @@
+id: "MNT_002"
+lvl: "S"
+sev: "L"
+cat: "MNT"
+lang: ["py"]
+state: "T"
+met: {"type": "public_api_documentation", "expr": {"python_exported_name_missing_docstring": true}}
+det: [{"tool": "sa", "rule": "python_ast_public_api_docstring"}]
+act: "RCM"
+autofix: {"type": "manual_assist"}
+gate: {"detector": "python_public_api_docstring", "public_boundary": "__all__"}
+rat: "公开 API 缺少契约注释 -> 调用者依赖实现细节 抽象边界不清 后续修改风险升高 ; #接口文档 #显性设计"

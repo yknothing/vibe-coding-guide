@@ -8,6 +8,7 @@ The prototype maps findings back to the existing rule anchors:
 
 - `IMP_004` for magic numeric literals
 - `MNT_001` for hardcoded URLs, hosts, and ports
+- `MNT_002` for Python names explicitly exported via `__all__` without docstrings
 - `IMP_007` for function complexity above the configured threshold
 
 ## Claude Code Setup
@@ -90,7 +91,7 @@ green turn must produce a refactoring diff.
 Validate the split rule sources:
 
 ```bash
-python3 tools/validate_rules.py rules --require IMP_004 --require IMP_007 --require MNT_001
+python3 tools/validate_rules.py rules --require IMP_004 --require IMP_007 --require MNT_001 --require MNT_002
 ```
 
 ## Suppression

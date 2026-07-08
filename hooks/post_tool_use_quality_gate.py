@@ -545,6 +545,59 @@ def scan_python_complexity_builtin(path: Path, root: Path, threshold: int) -> li
     return visitor.issues
 
 
+def exported_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets):
+            continue
+        if not isinstance(node.value, (ast.List, ast.Tuple)):
+            continue
+        for item in node.value.elts:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                names.add(item.value)
+    return names
+
+
+def scan_python_public_api_docstrings(path: Path, root: Path) -> list[Issue]:
+    if path.suffix not in PYTHON_EXTENSIONS:
+        return []
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+    exports = exported_names(tree)
+    if not exports:
+        return []
+
+    issues: list[Issue] = []
+    rel = relative_path(path, root)
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if node.name not in exports or ast.get_docstring(node):
+            continue
+        issues.append(
+            Issue(
+                rule_id="MNT_002",
+                severity="L",
+                category="MNT",
+                file_path=rel,
+                start_line=node.lineno,
+                end_line=getattr(node, "end_lineno", node.lineno),
+                message=f"Exported Python API `{node.name}` should have a docstring.",
+                detailed_explanation=(
+                    "公开 API 缺少契约注释会让调用者依赖实现细节；"
+                    "请在导出对象上写明意图、参数语义、边界行为和不变量。"
+                ),
+                suggested_action="RCM",
+                metric_values={"detector": "python_ast_public_api_docstring", "export": node.name},
+            )
+        )
+    return issues
+
+
 def python_complexity_metrics(path: Path) -> dict[str, int]:
     metrics = {
         "python_function_count": 0,
@@ -934,6 +987,7 @@ def scan_files(
 
     for path in files:
         issues.extend(scan_magic_values_builtin(path, root))
+        issues.extend(scan_python_public_api_docstrings(path, root))
         if not lizard_available and path.suffix in PYTHON_EXTENSIONS:
             issues.extend(scan_python_complexity_builtin(path, root, threshold))
 
