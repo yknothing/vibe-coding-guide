@@ -18,6 +18,13 @@ docs/
     legacy-code.md            《修改代码的艺术》：遗留代码手术规程
     refactoring.md            《重构》：两顶帽子、小步绿灯、坏味道分拣
     tdd.md                    《测试驱动开发》：红灯实证、测试清单、三角化
+    pragmatic-programmer.md   《程序员修炼之道》：DRY、正交性、曳光弹、破窗
+    mythical-man-month.md     《人月神话 / 没有银弹》：协调成本、概念完整性、原型
+    domain-driven-design.md   《领域驱动设计》：统一语言、限界上下文、核心域
+    release-it.md             《Release It!》：稳定性模式、集成点、生产韧性
+    accelerate.md             《Accelerate / DORA》：交付绩效指标与组织反馈闭环
+    out-of-the-tar-pit.md     《Out of the Tar Pit》：状态预算、控制流预算
+    unix-philosophy.md        Unix 哲学：单一职责、组合性、文本/结构化接口
 for-ai/                       v1 遗产（反例标本 + schema 骨架；执行层定位已被 STRATEGY.md 否定）
   rules/code_review_rules.md  v1 规则集：90 条单体规则（作为反例标本保留）
   rules/issue.schema.json     v1 输出契约（后续对齐 SARIF）

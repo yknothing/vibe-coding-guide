@@ -102,12 +102,12 @@ Ousterhout 给复杂度下的操作性定义是三个症状。登记册把它们
 | 修改代码的艺术（Feathers） | 流程 + 门禁（遗留代码手术规程） | ✅ [legacy-code.md](./legacy-code.md) |
 | 重构（Fowler） | 流程 + 提问（两顶帽子、坏味道分拣） | ✅ [refactoring.md](./refactoring.md) |
 | 测试驱动开发（Beck） | 流程（红灯实证、三角化） | ✅ [tdd.md](./tdd.md) |
-| 程序员修炼之道 | 流程 + 门禁（曳光弹、破窗、DRY） | 待编译 |
-| 人月神话 / 没有银弹 | 残渣 + 经济学重估（概念完整性、扔掉第一版） | 部分见本文第 4 节 |
-| 领域驱动设计（Evans） | 范例 + 提问（统一语言、限界上下文） | 待编译 |
-| Release It!（Nygard） | 门禁 + 流程（稳定性模式、舱壁、断路器） | 待编译 |
-| Accelerate / DORA | 度量（回路仪表盘的宏观层） | 待编译 |
-| Out of the Tar Pit | 语义转译（状态最小化 → 可审计的状态预算） | 待编译 |
-| Unix 哲学（Raymond/McIlroy） | 门禁 + 范例（做一件事、文本接口、组合性） | 待编译 |
+| 程序员修炼之道 | 流程 + 门禁（曳光弹、破窗、DRY） | ✅ [pragmatic-programmer.md](./pragmatic-programmer.md) |
+| 人月神话 / 没有银弹 | 残渣 + 经济学重估（概念完整性、扔掉第一版） | ✅ [mythical-man-month.md](./mythical-man-month.md) |
+| 领域驱动设计（Evans） | 范例 + 提问（统一语言、限界上下文） | ✅ [domain-driven-design.md](./domain-driven-design.md) |
+| Release It!（Nygard） | 门禁 + 流程（稳定性模式、舱壁、断路器） | ✅ [release-it.md](./release-it.md) |
+| Accelerate / DORA | 度量（回路仪表盘的宏观层） | ✅ [accelerate.md](./accelerate.md) |
+| Out of the Tar Pit | 语义转译（状态最小化 → 可审计的状态预算） | ✅ [out-of-the-tar-pit.md](./out-of-the-tar-pit.md) |
+| Unix 哲学（Raymond/McIlroy） | 门禁 + 范例（做一件事、文本接口、组合性） | ✅ [unix-philosophy.md](./unix-philosophy.md) |
 
 贡献方式：按第 2 节 schema 起草条目，Goodhart 申报缺失的一律打回；每个条目实现后，把状态从 T 推到 P 的依据是第 3 节的度量发生了可观测变化。
