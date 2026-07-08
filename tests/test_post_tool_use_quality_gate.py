@@ -1049,6 +1049,68 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertIn("ruff magic", result.stderr)
             self.assertIn("IMP_007", result.stderr)
 
+    def test_lizard_headerless_csv_output_is_parsed_in_require_tools_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "complex.py"
+            target.write_text(
+                textwrap.dedent(
+                    """
+                    def route(status, retries, region):
+                        if status == 2:
+                            return "retry"
+                        if retries > 3:
+                            return "escalate"
+                        if region == 4:
+                            return "manual"
+                        if status == 5:
+                            return "fail"
+                        return "ok"
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            make_executable(
+                bin_dir / "ruff",
+                "#!/bin/sh\nprintf '%s\\n' '[]'\n",
+            )
+            make_executable(
+                bin_dir / "eslint",
+                "#!/bin/sh\nprintf '%s\\n' '[]'\n",
+            )
+            make_executable(
+                bin_dir / "lizard",
+                "#!/bin/sh\n"
+                "printf '%s\\n' '10,12,80,3,11,\"route@1-11@complex.py\",\"complex.py\",\"route\",\"route( status, retries, region )\",1,11'\n",
+            )
+            payload = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "cwd": str(workspace),
+                "tool_input": {"file_path": "complex.py"},
+            }
+
+            result = self.run_hook(
+                workspace,
+                payload,
+                "--format",
+                "json",
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "fail")
+            self.assertEqual(report["tool_errors"], [])
+            complexity_issues = [issue for issue in report["issues"] if issue["rule_id"] == "IMP_007"]
+            self.assertGreaterEqual(len(complexity_issues), 1)
+            self.assertEqual(complexity_issues[0]["file_path"], "complex.py")
+            self.assertEqual(complexity_issues[0]["start_line"], 1)
+
     def test_require_tools_fails_closed_on_detector_nonzero_even_with_parseable_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

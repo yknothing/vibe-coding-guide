@@ -1334,11 +1334,10 @@ def run_lizard(
         return [], [ToolError("lizard", "lizard produced empty CSV output.")], True
 
     issues: list[Issue] = []
-    reader = csv.DictReader(io.StringIO(result.stdout))
-    required_fields = {"CCN", "location", "file", "function"}
-    if reader.fieldnames is None or not required_fields.issubset(set(reader.fieldnames)):
+    rows = parse_lizard_csv(result.stdout)
+    if not rows:
         return [], [ToolError("lizard", "lizard CSV output is missing required fields.")], True
-    for row in reader:
+    for row in rows:
         try:
             ccn = int(float(row.get("CCN", "0")))
         except ValueError:
@@ -1346,7 +1345,7 @@ def run_lizard(
         if ccn <= threshold:
             continue
         file_path = Path(row.get("file") or "").resolve()
-        location = row.get("location") or "1"
+        location = row.get("start_line") or row.get("location") or "1"
         line_text = location.split(":", 1)[0]
         try:
             line = int(line_text)
@@ -1375,6 +1374,28 @@ def run_lizard(
             )
         )
     return issues, [], True
+
+
+def parse_lizard_csv(output: str) -> list[dict[str, str]]:
+    required_fields = {"CCN", "location", "file", "function"}
+    reader = csv.DictReader(io.StringIO(output))
+    if reader.fieldnames and required_fields.issubset(set(reader.fieldnames)):
+        return list(reader)
+
+    rows: list[dict[str, str]] = []
+    for columns in csv.reader(io.StringIO(output)):
+        if len(columns) < 8:
+            continue
+        rows.append(
+            {
+                "CCN": columns[1],
+                "location": columns[5],
+                "file": columns[6],
+                "function": columns[7],
+                "start_line": columns[9] if len(columns) > 9 else columns[5],
+            }
+        )
+    return rows
 
 
 def dedupe_issues(issues: list[Issue]) -> list[Issue]:
