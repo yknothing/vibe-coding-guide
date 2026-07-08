@@ -370,9 +370,13 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 "schema_version",
                 "gate",
                 "status",
+                "run_id",
                 "rule_version",
                 "timestamp",
+                "duration_ms",
                 "root",
+                "source",
+                "detectors",
                 "scanned_files",
                 "skipped_files",
                 "rules_loaded",
@@ -385,6 +389,13 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 self.assertIn(field, payload)
             self.assertEqual(payload["gate"], "post_tool_use_quality_gate")
             self.assertEqual(payload["status"], "fail")
+            self.assertIsInstance(payload["run_id"], str)
+            self.assertGreater(len(payload["run_id"]), 10)
+            self.assertIsInstance(payload["duration_ms"], int)
+            self.assertGreaterEqual(payload["duration_ms"], 0)
+            self.assertEqual(payload["source"]["mode"], "direct_files")
+            self.assertIn("ruff", payload["detectors"])
+            self.assertIn("lizard", payload["detectors"])
             self.assertEqual(payload["scanned_files"], ["bad.py"])
             self.assertEqual(
                 set(payload["rules_loaded"]),
@@ -697,6 +708,45 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertIn("Quality gate setup failed", result.stderr)
             self.assertIn("ruff", result.stderr)
 
+    def test_require_tools_checks_all_detectors_even_for_python_only_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text("MAX_RETRIES = 3\n", encoding="utf-8")
+            make_executable(
+                bin_dir / "ruff",
+                "#!/bin/sh\nprintf '%s\\n' '[]'\n",
+            )
+            make_executable(
+                bin_dir / "lizard",
+                "#!/bin/sh\nprintf '%s\\n' 'NLOC,CCN,token,PARAM,length,location,file,function'\n",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--format",
+                    "json",
+                    "--require-tools",
+                    "--files",
+                    str(target),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertFalse(report["detectors"]["eslint"]["available"])
+            self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
+
     def test_require_tools_fails_closed_on_malformed_lizard_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -738,7 +788,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(report["tool_errors"][0]["tool"], "lizard")
             self.assertEqual(result.stderr, "")
 
-    def test_unsupported_file_is_reported_as_skipped_in_json(self) -> None:
+    def test_unsupported_only_file_is_incomplete_not_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             target = workspace / "README.md"
@@ -752,11 +802,105 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.returncode, 1, result.stdout)
             report = json.loads(result.stdout)
-            self.assertEqual(report["status"], "pass")
+            self.assertEqual(report["status"], "incomplete")
             self.assertEqual(report["skipped_files"][0]["path"], "README.md")
             self.assertEqual(report["skipped_files"][0]["reason"], "unsupported_extension")
+            self.assertEqual(report["summary"]["scanned_file_count"], 0)
+
+    def test_empty_files_argument_is_incomplete_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+
+            result = subprocess.run(
+                [sys.executable, str(HOOK), "--format", "json", "--files"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "incomplete")
+            self.assertEqual(report["summary"]["scanned_file_count"], 0)
+
+    def test_bash_payload_without_changed_files_is_incomplete_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            payload = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "cwd": str(workspace),
+                "tool_input": {"command": "true"},
+            }
+
+            result = self.run_hook(workspace, payload, "--format", "json")
+
+            self.assertEqual(result.returncode, 2, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "incomplete")
+            self.assertEqual(report["source"]["tool_name"], "Bash")
+            self.assertEqual(report["summary"]["scanned_file_count"], 0)
+
+    def test_doctor_reports_missing_detectors_in_strict_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": "/nonexistent"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["schema_version"], "quality-gate-doctor/v1")
+            self.assertEqual(report["status"], "fail")
+            self.assertFalse(report["strict_ready"])
+            failed_checks = {check["id"] for check in report["checks"] if check["status"] == "fail"}
+            self.assertIn("detector.ruff", failed_checks)
+            self.assertIn("detector.eslint", failed_checks)
+            self.assertIn("detector.lizard", failed_checks)
+
+    def test_doctor_warns_about_missing_detectors_without_strict_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": "/nonexistent"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "warn")
+            self.assertFalse(report["strict_ready"])
 
     def test_external_tool_outputs_are_parsed_in_require_tools_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

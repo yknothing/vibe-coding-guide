@@ -12,6 +12,21 @@ The prototype maps findings back to the existing rule anchors:
 - `MNT_002` for Python names explicitly exported via `__all__` without docstrings
 - `IMP_007` for function complexity above the configured threshold
 
+## Doctor
+
+Check local readiness before enabling strict hook mode:
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor
+python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --format json
+```
+
+`--doctor` emits `quality-gate-doctor/v1`. Non-strict mode returns `warn` when
+external detectors are missing because fallback detectors can still run. Strict
+mode treats missing `ruff`, `eslint`, or `lizard` as `fail`; do not enable
+`--require-tools` in an adapter until doctor reports `strict_ready: true`.
+
 ## Claude Code Setup
 
 Install the detector tools first:
@@ -28,7 +43,7 @@ Then add this project-scoped hook to `.claude/settings.json`:
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit",
+        "matcher": "Edit|Write|MultiEdit|Bash",
         "hooks": [
           {
             "type": "command",
@@ -46,6 +61,11 @@ Then add this project-scoped hook to `.claude/settings.json`:
 is treated as a setup failure instead of a green pass. The script still has
 built-in fallback detectors so the repository can run deterministic tests
 without installing those tools.
+
+`Bash` is included because shell commands can create or modify files without
+going through `Edit` / `Write` / `MultiEdit`. When a `Bash` payload does not
+include a path, the hook falls back to `git status --porcelain` and scans changed
+supported files.
 
 ## Manual Checks
 
@@ -69,9 +89,13 @@ python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.p
 ```
 
 JSON output is a stable wrapper with `schema_version`, `status`, `timestamp`,
-`scanned_files`, `skipped_files`, `rules_loaded`, `metrics`, `ratchet`,
-`issues`, `tool_errors`, and `summary`. Individual `issues` keep the required fields from
-`for-ai/rules/issue.schema.json`.
+`run_id`, `duration_ms`, `source`, `detectors`, `scanned_files`, `skipped_files`,
+`rules_loaded`, `metrics`, `ratchet`, `issues`, `tool_errors`, and `summary`.
+Individual `issues` keep the required fields from `for-ai/rules/issue.schema.json`.
+
+`status: incomplete` means the gate did not scan any supported files, usually
+because every input path was unsupported, outside the project, duplicated, or
+missing. Treat it as "no quality claim," not as a pass.
 
 ## Quality Ratchet
 

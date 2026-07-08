@@ -1,0 +1,87 @@
+# IDE-neutral adapter contract
+
+> 本页是质量门禁的安装部署边界。核心原则：检测逻辑只在一个 IDE-neutral
+> core 中实现；Codex、Claude Code、Cursor、Qoder、Trae、Droid 等入口只做薄 adapter，
+> 把各自事件转成同一份输入契约，再消费同一份 JSON report。
+
+## 状态分级
+
+| 状态 | 含义 |
+|---|---|
+| `planned` | 路线已列入矩阵，但 native adapter 尚无安装说明或 smoke。 |
+| `unsupported` | 尚未定义入口，不应在 README 或发布说明中宣称可用。 |
+| `documented` | 已有安装说明或 adapter contract，但尚未通过本仓库 smoke test。 |
+| `smoke-tested` | 有可重放 smoke 命令，能证明入口会调用 core 并产生预期 report。 |
+| `dogfooded` | 本仓库日常使用该入口，并保留失败/通过记录。 |
+
+未达到 `smoke-tested` 的目标只能称为 planned 或 documented，不能称为 supported。
+
+## Core 输入契约
+
+所有 adapter 最终都应提供这些字段；拿不到的字段必须显式为 `null` 或省略后由 core
+标记为 unavailable，不得编造。
+
+| 字段 | 必需 | 说明 |
+|---|---|---|
+| `cwd` | 是 | 项目根目录。所有相对路径都基于它解析。 |
+| `files` | 是 | 本轮要扫描的文件列表。hook 无法直接给出时，可由 adapter 从 git diff/status 推导。 |
+| `event_source` | 是 | 事件来源，例如 `generic-cli`、`claude-code-post-tool-use`、`codex-cli`。 |
+| `tool_name` | 否 | IDE/CLI 暴露的工具名，例如 `Edit`、`Write`、`Bash`。 |
+| `baseline_path` | 否 | 棘轮 baseline JSON；没有时 report 必须是 `not_configured`。 |
+| `strict` | 是 | 是否要求外部 detector 全部存在。strict 模式缺工具必须 fail closed。 |
+| `adapter_metadata` | 否 | adapter 自己的版本、配置文件路径、触发器名称等。 |
+
+当前 core 的最小入口是：
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --files path/to/file.py --format json
+python3 hooks/post_tool_use_quality_gate.py --hook --format json
+```
+
+`--doctor` 用来检查本机是否具备启用 strict gate 的条件：
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor --format json
+python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
+```
+
+## Core 输出契约
+
+adapter 必须把 JSON report 原样保留或转发给上层 UI，不应只截取人类文本。
+
+关键字段：
+
+| 字段 | 说明 |
+|---|---|
+| `schema_version` | 当前为 `quality-gate-report/v1`。 |
+| `run_id` | 单次运行 ID，用于跨日志关联。 |
+| `status` | `pass`、`fail`、`error` 或 `incomplete`。 |
+| `source` | core 看到的入口模式与 adapter 名称。 |
+| `detectors` | `ruff`、`eslint`、`lizard` 的可用性、路径和版本。 |
+| `scanned_files` | 实际扫描的文件。 |
+| `skipped_files` | 未扫描文件及原因。skipped-only 不能视为 pass。 |
+| `metrics` | 当前可计算质量指标。 |
+| `ratchet` | 棘轮状态；未传 baseline 时必须显示 `not_configured`。 |
+| `issues` | 规则命中，使用稳定 `rule_id`。 |
+| `tool_errors` | detector、输入、规则加载或 baseline 读取错误。 |
+| `summary` | 计数摘要。 |
+
+## 能力矩阵
+
+| Target | Native 状态 | 当前可用入口 | 最小验收 |
+|---|---|---|---|
+| Generic CLI | `smoke-tested` | `--files` | 对 clean/bad Python 文件分别返回 `pass`/`fail`，并输出 JSON report。 |
+| Claude Code | `documented` | `PostToolUse` 调用 `--hook` | 项目 hook 配置触发 `Edit`、`Write`、`MultiEdit`、`Bash` 后，bad file exit 2，clean file exit 0。 |
+| Codex | `planned` | Generic CLI fallback | 在 Codex 任务中用 `--files` 或 git diff 文件列表调用 core；native adapter 待验证。 |
+| Cursor | `planned` | Generic CLI fallback | 在 Cursor 任务后能调用 core 并保留 JSON report；native adapter 待验证。 |
+| Qoder | `planned` | Generic CLI fallback | 在 Qoder 任务后能调用 core 并保留 JSON report；native adapter 待验证。 |
+| Trae | `planned` | Generic CLI fallback | 在 Trae 任务后能调用 core 并保留 JSON report；native adapter 待验证。 |
+| Droid | `planned` | Generic CLI fallback | 在 Droid 任务后能调用 core 并保留 JSON report；native adapter 待验证。 |
+
+## 不可宣称的内容
+
+- 未通过 smoke test 的目标不得称为已支持。
+- 缺 `baseline_path` 不代表 ratchet 已保护当前改动。
+- `skipped_files` 不为空时，不得把零扫描解读成质量良好。
+- 缺 context/defect 数据时，不得从 dashboard 推断无成本、无缺陷或无逃逸。
+- adapter 不能把本地缺工具降级成 pass；strict 模式必须 fail closed。

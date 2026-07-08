@@ -5,10 +5,45 @@
 > 本仓库正在从"给 AI 读的规则库"（v1，已被实践证伪）重构为**Agent 编码质量门禁套件与编译方法论**。
 > 转向的完整论证见 [docs/STRATEGY.md](./docs/STRATEGY.md)。
 
+## 10 分钟跑通
+
+本仓库当前最重要的使用路径是 **IDE-neutral quality gate core**：同一套检测逻辑先通过
+Generic CLI 跑通，再由各 IDE/CLI 的薄 adapter 接入。Claude Code 已有 documented
+`PostToolUse` 路径；Codex、Cursor、Qoder、Trae、Droid 目前使用 Generic CLI fallback，
+native adapter 仍是 planned。adapter 能力、状态分级和输入/输出契约见
+[docs/ADAPTERS.md](./docs/ADAPTERS.md)。
+
+先检查本机能不能启用严格门禁：
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor
+python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
+```
+
+如果缺 detector，安装当前 strict mode 依赖：
+
+```bash
+python3 -m pip install ruff lizard
+npm install -g eslint
+```
+
+再跑最小验证：
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 tools/validate_rules.py rules --require DSN_001 --require IMP_004 --require IMP_007 --require MNT_001 --require MNT_002
+python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.py
+```
+
+JSON report 的 `status` 可能是 `pass`、`fail`、`error` 或 `incomplete`。其中 `incomplete`
+表示没有扫描到支持的文件，不能当作质量绿灯。接入具体 IDE/CLI 前，先用 Generic CLI 跑通；
+再按 [hooks/README.md](./hooks/README.md) 或 [docs/ADAPTERS.md](./docs/ADAPTERS.md) 选择对应 adapter。
+
 ## 实际目录结构（与磁盘一致）
 
 ```text
 docs/
+  ADAPTERS.md                 IDE-neutral core contract、能力矩阵与 adapter 验收边界
   STRATEGY.md                 仓库战略评估：知识注入路线为何失败，为何改走门禁套件
   COMPILING-THE-CLASSICS.md   方法论：六条第一性原理、验证不对称性、六种编译形态
   registry/                   编译登记册（活文档）：逐书逐章把经典编译为可实现的机制
@@ -37,8 +72,9 @@ tools/                        规则加载、校验、APOSD_02a 仪表盘与 APO
 
 ## 可运行门禁原型
 
-当前第一条工程化路径是 `hooks/post_tool_use_quality_gate.py`：一个面向 Claude Code
-`PostToolUse` 的质量门禁原型，覆盖 `Edit` / `Write` / `MultiEdit` 后的改动文件扫描。
+当前第一条工程化路径是 `hooks/post_tool_use_quality_gate.py`：一个 IDE-neutral
+质量门禁 core。它可以直接通过 `--files` 扫描文件，也可以由 Claude Code `PostToolUse`
+或其他 IDE/CLI adapter 转入同一份输入契约。
 
 它目前接线五条规则：
 
@@ -51,6 +87,7 @@ tools/                        规则加载、校验、APOSD_02a 仪表盘与 APO
 运行本地验证：
 
 ```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor --format json
 python3 -m unittest discover -s tests -v
 python3 tools/validate_rules.py rules --require DSN_001 --require IMP_004 --require IMP_007 --require MNT_001 --require MNT_002
 python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.py

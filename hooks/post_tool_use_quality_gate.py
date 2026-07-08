@@ -11,10 +11,13 @@ import datetime as dt
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +30,58 @@ from tools.rule_loader import Rule, RuleValidationError, load_rules
 
 RULE_VERSION = "2025.v1.0.cn"
 REPORT_SCHEMA_VERSION = "quality-gate-report/v1"
+DOCTOR_SCHEMA_VERSION = "quality-gate-doctor/v1"
 TOOL_TIMEOUT_SECONDS = 30
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
+REQUIRED_DETECTORS = ("ruff", "eslint", "lizard")
+ADAPTER_TARGETS = [
+    {
+        "target": "generic-cli",
+        "status": "smoke-tested",
+        "entrypoint": "--files",
+        "notes": "IDE-neutral file scan entrypoint.",
+    },
+    {
+        "target": "claude-code",
+        "status": "documented",
+        "entrypoint": "--hook",
+        "notes": "PostToolUse adapter contract; project hook smoke still required.",
+    },
+    {
+        "target": "codex",
+        "status": "planned",
+        "entrypoint": "generic-cli",
+        "notes": "Use the IDE-neutral CLI until a native event adapter is verified.",
+    },
+    {
+        "target": "cursor",
+        "status": "planned",
+        "entrypoint": "generic-cli",
+        "notes": "Use the IDE-neutral CLI until a native event adapter is verified.",
+    },
+    {
+        "target": "qoder",
+        "status": "planned",
+        "entrypoint": "generic-cli",
+        "notes": "Use the IDE-neutral CLI until a native event adapter is verified.",
+    },
+    {
+        "target": "trae",
+        "status": "planned",
+        "entrypoint": "generic-cli",
+        "notes": "Use the IDE-neutral CLI until a native event adapter is verified.",
+    },
+    {
+        "target": "droid",
+        "status": "planned",
+        "entrypoint": "generic-cli",
+        "notes": "Use the IDE-neutral CLI until a native event adapter is verified.",
+    },
+]
 DEFAULT_COMPLEXITY_THRESHOLD = 10
 DEFAULT_MAX_ISSUES = 25
+JSON_INDENT = 2
+MILLISECONDS_PER_SECOND = 1000
 MAX_TOTAL_METRICS = {"python_max_cyclomatic_complexity"}
 RATCHET_METRICS = {
     "hardcoded_endpoint_count",
@@ -124,9 +175,23 @@ class RatchetViolation:
     message: str
 
 
+@dataclasses.dataclass(frozen=True)
+class DoctorCheck:
+    id: str
+    status: str
+    message: str
+    detail: dict[str, Any] | None = None
+    remediation: str | None = None
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scan PostToolUse-edited files for magic values and complexity."
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Check local dependencies, rule loading, and adapter readiness.",
     )
     parser.add_argument(
         "--hook",
@@ -257,6 +322,207 @@ def run_detector(command: list[str]) -> tuple[subprocess.CompletedProcess[str] |
         )
     except subprocess.TimeoutExpired:
         return None, ToolError(tool, f"{tool} timed out after {TOOL_TIMEOUT_SECONDS}s.")
+
+
+def command_version(command: str) -> str | None:
+    result, error = run_detector([command, "--version"])
+    if error or result is None or result.returncode != 0:
+        return None
+    version = (result.stdout or result.stderr).strip().splitlines()
+    return version[0] if version else None
+
+
+def detector_inventory() -> dict[str, dict[str, Any]]:
+    inventory: dict[str, dict[str, Any]] = {}
+    for detector in REQUIRED_DETECTORS:
+        path = shutil.which(detector)
+        inventory[detector] = {
+            "available": path is not None,
+            "path": path,
+            "version": command_version(path) if path else None,
+        }
+    return inventory
+
+
+def required_detector_errors(detectors: dict[str, dict[str, Any]]) -> list[ToolError]:
+    errors: list[ToolError] = []
+    for detector in REQUIRED_DETECTORS:
+        info = detectors.get(detector, {})
+        if not info.get("available"):
+            errors.append(
+                ToolError(
+                    detector,
+                    f"{detector} is required in strict --require-tools mode. {detector_remediation(detector)}",
+                )
+            )
+    return errors
+
+
+def detector_remediation(detector: str) -> str:
+    if detector in {"ruff", "lizard"}:
+        return f"Install with `python3 -m pip install {detector}`."
+    if detector == "eslint":
+        return "Install with `npm install -g eslint`."
+    return f"Install `{detector}` and make sure it is on PATH."
+
+
+def report_source(args: argparse.Namespace, event: dict[str, Any] | None) -> dict[str, Any]:
+    if args.hook:
+        return {
+            "mode": "hook",
+            "adapter": "claude-code-post-tool-use",
+            "hook_event_name": event.get("hook_event_name") if event else None,
+            "tool_name": event.get("tool_name") if event else None,
+        }
+    return {
+        "mode": "direct_files",
+        "adapter": "generic-cli",
+        "hook_event_name": None,
+        "tool_name": None,
+    }
+
+
+def doctor_status(checks: list[DoctorCheck]) -> str:
+    statuses = {check.status for check in checks}
+    if "fail" in statuses:
+        return "fail"
+    if "warn" in statuses:
+        return "warn"
+    return "pass"
+
+
+def build_doctor_report(root: Path, rules_dir: Path, require_tools: bool) -> dict[str, Any]:
+    checks: list[DoctorCheck] = []
+    checks.append(
+        DoctorCheck(
+            id="python.runtime",
+            status="pass",
+            message=f"Python runtime: {platform.python_version()}",
+            detail={"executable": sys.executable, "version": platform.python_version()},
+        )
+    )
+    checks.append(
+        DoctorCheck(
+            id="project.root",
+            status="pass" if root.exists() else "fail",
+            message=f"Project root {'exists' if root.exists() else 'does not exist'}: {root}",
+            detail={"root": root.as_posix()},
+            remediation=None if root.exists() else "Pass --root or run the command from the project root.",
+        )
+    )
+    checks.append(
+        DoctorCheck(
+            id="script.executable",
+            status="pass" if os.access(__file__, os.X_OK) else "warn",
+            message=(
+                "Hook script is executable."
+                if os.access(__file__, os.X_OK)
+                else "Hook script is not executable; invoke it with python3 or chmod +x it."
+            ),
+            detail={"path": Path(__file__).resolve().as_posix()},
+            remediation=None if os.access(__file__, os.X_OK) else "Run via `python3` or set executable bit.",
+        )
+    )
+
+    loaded_rules: list[str] = []
+    try:
+        loaded_rules = sorted(load_rules(rules_dir))
+        checks.append(
+            DoctorCheck(
+                id="rules.load",
+                status="pass",
+                message=f"Loaded {len(loaded_rules)} rule(s).",
+                detail={"rules_dir": rules_dir.as_posix(), "rules": loaded_rules},
+                remediation=None,
+            )
+        )
+    except RuleValidationError as exc:
+        checks.append(
+            DoctorCheck(
+                id="rules.load",
+                status="fail",
+                message=str(exc),
+                detail={"rules_dir": rules_dir.as_posix()},
+                remediation="Fix the rule YAML or pass a valid --rules-dir.",
+            )
+        )
+
+    detectors = detector_inventory()
+    for detector, info in detectors.items():
+        available = bool(info["available"])
+        checks.append(
+            DoctorCheck(
+                id=f"detector.{detector}",
+                status="pass" if available else "fail" if require_tools else "warn",
+                message=(
+                    f"{detector} found at {info['path']}"
+                    if available
+                    else f"{detector} not found; strict --require-tools mode will fail closed."
+                ),
+                detail=info,
+                remediation=None if available else detector_remediation(detector),
+            )
+        )
+
+    strict_ready = all(bool(info["available"]) for info in detectors.values()) and all(
+        check.status != "fail" for check in checks
+    )
+    status = doctor_status(checks)
+    return {
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "status": status,
+        "strict_ready": strict_ready,
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "root": root.as_posix(),
+        "rules_loaded": loaded_rules,
+        "detectors": detectors,
+        "adapter_targets": ADAPTER_TARGETS,
+        "checks": [dataclasses.asdict(check) for check in checks],
+        "next_steps": doctor_next_steps(status, strict_ready),
+    }
+
+
+def doctor_next_steps(status: str, strict_ready: bool) -> list[str]:
+    if strict_ready:
+        return [
+            "Run a direct file scan with --files before enabling an IDE hook.",
+            "Enable the target adapter only after its smoke test passes.",
+        ]
+    if status == "fail":
+        return [
+            "Follow the remediation field on each failed check.",
+            "Rerun --doctor --require-tools before enabling strict adapter mode.",
+        ]
+    return [
+        "Fallback detectors can run, but install ruff, eslint, and lizard before strict gate mode.",
+        "Use docs/ADAPTERS.md to choose a verified target path.",
+    ]
+
+
+def render_doctor_text(report: dict[str, Any]) -> str:
+    lines = [
+        f"Quality gate doctor: {report['status']}",
+        f"strict_ready: {str(report['strict_ready']).lower()}",
+    ]
+    for check in report["checks"]:
+        lines.append(f"- {check['status']}: {check['id']}: {check['message']}")
+        if check.get("remediation"):
+            lines.append(f"  remediation: {check['remediation']}")
+    lines.append("Next steps:")
+    for step in report["next_steps"]:
+        lines.append(f"- {step}")
+    return "\n".join(lines)
+
+
+def run_doctor(args: argparse.Namespace, root: Path) -> int:
+    report = build_doctor_report(root, Path(args.rules_dir), args.require_tools)
+    if args.format == "json":
+        print(json.dumps(report, ensure_ascii=False, indent=JSON_INDENT))
+    else:
+        output = render_doctor_text(report)
+        stream = sys.stderr if report["status"] == "fail" else sys.stdout
+        print(output, file=stream)
+    return 1 if report["status"] == "fail" else 0
 
 
 def git_changed_files(root: Path) -> list[str]:
@@ -1035,6 +1301,18 @@ def dedupe_issues(issues: list[Issue]) -> list[Issue]:
     return deduped
 
 
+def dedupe_tool_errors(errors: list[ToolError]) -> list[ToolError]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[ToolError] = []
+    for error in errors:
+        key = (error.tool, error.message)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(error)
+    return deduped
+
+
 def scan_files(
     files: list[Path], root: Path, threshold: int, require_tools: bool
 ) -> tuple[list[Issue], list[ToolError]]:
@@ -1072,6 +1350,8 @@ def scan_files(
 def render_feedback(
     issues: list[Issue],
     tool_errors: list[ToolError],
+    skipped_files: list[SkippedFile],
+    files: list[Path],
     ratchet: dict[str, Any],
     max_issues: int,
 ) -> str:
@@ -1100,10 +1380,15 @@ def render_feedback(
         remaining = len(issues) - max_issues
         if remaining > 0:
             lines.append(f"- ... {remaining} more issue(s) omitted")
-    lines.append(
-        "Fix the reported literals/complexity before continuing, or add a narrow "
-        "ALLOW_MAGIC_NUMBER: reason, ticket comment for an intentional magic literal."
-    )
+    if skipped_files and not files and not issues and not tool_errors and not ratchet_violations:
+        lines.append("Quality gate did not scan any supported files:")
+        for skipped in skipped_files[:max_issues]:
+            lines.append(f"- {skipped.path or '<empty>'}: {skipped.reason}")
+    if issues or ratchet_violations:
+        lines.append(
+            "Fix the reported literals/complexity before continuing, or add a narrow "
+            "ALLOW_MAGIC_NUMBER: reason, ticket comment for an intentional magic literal."
+        )
     return "\n".join(lines)
 
 
@@ -1116,16 +1401,33 @@ def build_report(
     rules: dict[str, Rule],
     metrics: dict[str, Any],
     ratchet: dict[str, Any],
+    run_id: str,
+    started_at: float,
+    source: dict[str, Any],
+    detectors: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     ratchet_violations = ratchet.get("violations", [])
-    status = "error" if tool_errors else "fail" if issues or ratchet_violations else "pass"
+    no_scanned_files = not files and not issues and not tool_errors and not ratchet_violations
+    status = (
+        "error"
+        if tool_errors
+        else "fail"
+        if issues or ratchet_violations
+        else "incomplete"
+        if no_scanned_files
+        else "pass"
+    )
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "gate": "post_tool_use_quality_gate",
         "status": status,
+        "run_id": run_id,
         "rule_version": RULE_VERSION,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "duration_ms": int((time.monotonic() - started_at) * MILLISECONDS_PER_SECOND),
         "root": root.as_posix(),
+        "source": source,
+        "detectors": detectors,
         "scanned_files": [relative_path(path, root) for path in files],
         "skipped_files": [dataclasses.asdict(skipped) for skipped in skipped_files],
         "rules_loaded": sorted(rules),
@@ -1144,9 +1446,15 @@ def build_report(
 
 
 def main(argv: list[str]) -> int:
+    started_at = time.monotonic()
+    run_id = str(uuid.uuid4())
     args = parse_args(argv)
     event: dict[str, Any] | None = None
     input_errors: list[ToolError] = []
+
+    if args.doctor:
+        root = determine_root(args, None)
+        return run_doctor(args, root)
 
     if args.hook:
         try:
@@ -1173,8 +1481,12 @@ def main(argv: list[str]) -> int:
 
     metrics = collect_quality_metrics(files, root)
     ratchet, ratchet_errors = evaluate_ratchet(metrics, args.ratchet_baseline)
+    detectors = detector_inventory()
+    strict_detector_errors = required_detector_errors(detectors) if args.require_tools else []
     issues, tool_errors = scan_files(files, root, args.complexity_threshold, args.require_tools)
-    all_errors = [*input_errors, *rule_errors, *tool_errors, *ratchet_errors]
+    all_errors = dedupe_tool_errors(
+        [*input_errors, *rule_errors, *strict_detector_errors, *tool_errors, *ratchet_errors]
+    )
     if rules:
         missing_issue_rules = sorted({issue.rule_id for issue in issues} - set(rules))
         if missing_issue_rules:
@@ -1186,18 +1498,37 @@ def main(argv: list[str]) -> int:
             )
         issues = apply_rule_metadata(issues, rules)
 
+    source = report_source(args, event)
+    report = build_report(
+        issues,
+        all_errors,
+        files,
+        skipped_files,
+        root,
+        rules,
+        metrics,
+        ratchet,
+        run_id,
+        started_at,
+        source,
+        detectors,
+    )
+
     if args.format == "json":
         print(
             json.dumps(
-                build_report(issues, all_errors, files, skipped_files, root, rules, metrics, ratchet),
+                report,
                 ensure_ascii=False,
-                indent=2,
+                indent=JSON_INDENT,
             )
         )
-    elif issues or all_errors or ratchet.get("violations"):
-        print(render_feedback(issues, all_errors, ratchet, args.max_issues), file=sys.stderr)
+    elif report["status"] != "pass":
+        print(
+            render_feedback(issues, all_errors, skipped_files, files, ratchet, args.max_issues),
+            file=sys.stderr,
+        )
 
-    if issues or all_errors or ratchet.get("violations"):
+    if report["status"] != "pass":
         return 2 if args.hook else 1
     return 0
 
