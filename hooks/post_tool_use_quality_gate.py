@@ -34,6 +34,32 @@ DOCTOR_SCHEMA_VERSION = "quality-gate-doctor/v1"
 TOOL_TIMEOUT_SECONDS = 30
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
 REQUIRED_DETECTORS = ("ruff", "eslint", "lizard")
+DETECTOR_INSTALLS: dict[str, dict[str, str]] = {
+    "ruff": {
+        "tool": "ruff",
+        "description": "Fast Python linter.",
+        "purpose": "Detects Python magic numeric literals through Ruff PLR2004 and complements the fallback AST scanner.",
+        "install_command": "python3 -m pip install --upgrade ruff",
+        "verify_command": "ruff --version",
+        "security_note": "Install from PyPI or an approved internal mirror. Do not use curl | sh installers.",
+    },
+    "eslint": {
+        "tool": "eslint",
+        "description": "JavaScript and TypeScript linter.",
+        "purpose": "Detects JavaScript and TypeScript magic numeric literals with no-magic-numbers.",
+        "install_command": "npm install -g eslint",
+        "verify_command": "eslint --version",
+        "security_note": "Install from npm or an approved internal registry. Do not use curl | sh installers.",
+    },
+    "lizard": {
+        "tool": "lizard",
+        "description": "Cyclomatic complexity analyzer.",
+        "purpose": "Measures cyclomatic complexity for IMP_007 and prevents complex functions from passing strict gate mode.",
+        "install_command": "python3 -m pip install --upgrade lizard",
+        "verify_command": "lizard --version",
+        "security_note": "Install from PyPI or an approved internal mirror. Do not use curl | sh installers.",
+    },
+}
 ADAPTER_TARGETS = [
     {
         "target": "generic-cli",
@@ -332,15 +358,32 @@ def command_version(command: str) -> str | None:
     return version[0] if version else None
 
 
-def detector_inventory() -> dict[str, dict[str, Any]]:
+def detector_install_info(detector: str) -> dict[str, str]:
+    info = DETECTOR_INSTALLS.get(detector)
+    if info:
+        return dict(info)
+    return {
+        "tool": detector,
+        "description": f"{detector} detector.",
+        "purpose": "Required by strict quality gate mode.",
+        "install_command": f"Install `{detector}` with your approved package manager.",
+        "verify_command": f"{detector} --version",
+        "security_note": "Use an approved package source. Do not use curl | sh installers.",
+    }
+
+
+def detector_inventory(include_install: bool = False) -> dict[str, dict[str, Any]]:
     inventory: dict[str, dict[str, Any]] = {}
     for detector in REQUIRED_DETECTORS:
         path = shutil.which(detector)
-        inventory[detector] = {
+        info: dict[str, Any] = {
             "available": path is not None,
             "path": path,
             "version": command_version(path) if path else None,
         }
+        if include_install:
+            info["install"] = detector_install_info(detector)
+        inventory[detector] = info
     return inventory
 
 
@@ -359,11 +402,35 @@ def required_detector_errors(detectors: dict[str, dict[str, Any]]) -> list[ToolE
 
 
 def detector_remediation(detector: str) -> str:
-    if detector in {"ruff", "lizard"}:
-        return f"Install with `python3 -m pip install {detector}`."
-    if detector == "eslint":
-        return "Install with `npm install -g eslint`."
-    return f"Install `{detector}` and make sure it is on PATH."
+    info = detector_install_info(detector)
+    return (
+        f"{info['description']} {info['purpose']} "
+        f"Install with `{info['install_command']}` and verify with `{info['verify_command']}`. "
+        f"{info['security_note']}"
+    )
+
+
+def detector_install_plan(detectors: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        detector_install_info(detector)
+        for detector in REQUIRED_DETECTORS
+        if not detectors.get(detector, {}).get("available")
+    ]
+
+
+def quick_install_commands(install_plan: list[dict[str, str]]) -> list[str]:
+    missing = {item["tool"] for item in install_plan}
+    commands: list[str] = []
+    python_tools = [detector for detector in ("ruff", "lizard") if detector in missing]
+    if python_tools:
+        commands.append(f"python3 -m pip install --upgrade {' '.join(python_tools)}")
+    if "eslint" in missing:
+        commands.append("npm install -g eslint")
+    for item in install_plan:
+        command = item["install_command"]
+        if item["tool"] not in {"ruff", "lizard", "eslint"} and command not in commands:
+            commands.append(command)
+    return commands
 
 
 def report_source(args: argparse.Namespace, event: dict[str, Any] | None) -> dict[str, Any]:
@@ -447,7 +514,8 @@ def build_doctor_report(root: Path, rules_dir: Path, require_tools: bool) -> dic
             )
         )
 
-    detectors = detector_inventory()
+    detectors = detector_inventory(include_install=True)
+    install_plan = detector_install_plan(detectors)
     for detector, info in detectors.items():
         available = bool(info["available"])
         checks.append(
@@ -476,6 +544,9 @@ def build_doctor_report(root: Path, rules_dir: Path, require_tools: bool) -> dic
         "root": root.as_posix(),
         "rules_loaded": loaded_rules,
         "detectors": detectors,
+        "tool_catalog": [detector_install_info(detector) for detector in REQUIRED_DETECTORS],
+        "install_plan": install_plan,
+        "quick_install_commands": quick_install_commands(install_plan),
         "adapter_targets": ADAPTER_TARGETS,
         "checks": [dataclasses.asdict(check) for check in checks],
         "next_steps": doctor_next_steps(status, strict_ready),
@@ -508,6 +579,23 @@ def render_doctor_text(report: dict[str, Any]) -> str:
         lines.append(f"- {check['status']}: {check['id']}: {check['message']}")
         if check.get("remediation"):
             lines.append(f"  remediation: {check['remediation']}")
+    if report.get("install_plan"):
+        lines.append("Install missing detector tools:")
+        for item in report["install_plan"]:
+            lines.append(f"- {item['tool']}: {item['description']} {item['purpose']}")
+            lines.append(f"  install: {item['install_command']}")
+            lines.append(f"  verify: {item['verify_command']}")
+        if report.get("quick_install_commands"):
+            lines.append("Quick install commands:")
+            for command in report["quick_install_commands"]:
+                lines.append(f"- {command}")
+        lines.append(
+            "Safety: use PyPI/npm or approved internal mirrors. Do not use curl | sh installers."
+        )
+        lines.append(
+            "Manual commands only: adapters must not run them without explicit user approval."
+        )
+        lines.append("After installing: Rerun --doctor --require-tools.")
     lines.append("Next steps:")
     for step in report["next_steps"]:
         lines.append(f"- {step}")

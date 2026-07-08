@@ -45,6 +45,46 @@ python3 hooks/post_tool_use_quality_gate.py --doctor --format json
 python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
 ```
 
+`quality-gate-doctor/v1` 的 `install_plan` 是安装提示契约。adapter 或安装脚本在缺工具时应展示：
+
+| Tool | What it is | Gate role | Recommended command |
+|---|---|---|---|
+| `ruff` | Fast Python linter | Python 魔法数字检测，使用 Ruff `PLR2004`。 | `python3 -m pip install --upgrade ruff` |
+| `lizard` | Cyclomatic complexity analyzer | 函数圈复杂度检测，用于 `IMP_007`。 | `python3 -m pip install --upgrade lizard` |
+| `eslint` | JavaScript and TypeScript linter | JS/TS 魔法数字检测，使用 `no-magic-numbers`。 | `npm install -g eslint` |
+
+快捷安装可使用 `quick_install_commands`，当前缺三项时是：
+
+```bash
+python3 -m pip install --upgrade ruff lizard
+npm install -g eslint
+```
+
+安全边界：这些命令只供人工确认后执行；adapter 和安装器不得静默执行。只使用 PyPI/npm、
+组织批准的内部镜像或 pinned/approved toolchain；Do not use `curl | sh` installers；
+Windows、no-global-npm 或受控环境应使用等价安装方式，并确保 detector 在 hook 的 `PATH` 中。
+安装后必须重跑 `python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools` 并确认
+`strict_ready: true`。
+
+## Doctor 输出契约
+
+`quality-gate-doctor/v1` 只用于安装、部署和 adapter readiness 检查。adapter 可以展示
+doctor report，但不能把 doctor-only 字段当成普通 scan report 的字段。
+
+关键字段：
+
+| 字段 | 说明 |
+|---|---|
+| `schema_version` | 当前为 `quality-gate-doctor/v1`。 |
+| `status` | `pass`、`warn` 或 `fail`。 |
+| `strict_ready` | 是否满足启用 strict gate 的前置条件。 |
+| `detectors` | `ruff`、`eslint`、`lizard` 的可用性、路径、版本和安装元数据。 |
+| `tool_catalog` | strict mode 依赖工具的用途、安装命令、验证命令和安全提示。 |
+| `install_plan` | 当前缺失工具的安装计划；安装器应直接展示，不应静默安装。 |
+| `quick_install_commands` | 针对当前缺失工具折叠后的快捷命令，只能在用户确认后执行。 |
+| `checks` | runtime、项目根、规则加载、detector readiness 等检查项。 |
+| `next_steps` | 当前状态下的下一步动作。 |
+
 ## Core 输出契约
 
 adapter 必须把 JSON report 原样保留或转发给上层 UI，不应只截取人类文本。

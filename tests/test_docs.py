@@ -26,6 +26,36 @@ class DocumentationTests(unittest.TestCase):
         for field in ["cwd", "files", "event_source", "baseline_path", "strict"]:
             self.assertIn(field, adapters)
 
+    def test_install_docs_explain_detector_tools_and_safe_commands(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        hook_readme = (ROOT / "hooks" / "README.md").read_text(encoding="utf-8")
+        adapters = (ROOT / "docs" / "ADAPTERS.md").read_text(encoding="utf-8")
+        combined = "\n".join([readme, hook_readme, adapters])
+
+        for detector in ["ruff", "eslint", "lizard"]:
+            self.assertIn(detector, combined)
+        self.assertIn("Fast Python linter", combined)
+        self.assertIn("JavaScript and TypeScript linter", combined)
+        self.assertIn("Cyclomatic complexity analyzer", combined)
+        self.assertIn("python3 -m pip install --upgrade ruff lizard", combined)
+        self.assertIn("npm install -g eslint", combined)
+        self.assertIn("Do not use `curl | sh`", combined)
+        self.assertIn("不得静默执行", combined)
+        self.assertIn("--doctor --require-tools", combined)
+
+    def test_adapter_docs_keep_doctor_install_fields_out_of_scan_report_contract(self) -> None:
+        adapters = (ROOT / "docs" / "ADAPTERS.md").read_text(encoding="utf-8")
+
+        self.assertIn("Doctor 输出契约", adapters)
+        self.assertIn("doctor-only", adapters)
+        scan_contract = adapters.split("## Core 输出契约", maxsplit=1)[1].split(
+            "## 能力矩阵",
+            maxsplit=1,
+        )[0]
+        self.assertNotIn("`tool_catalog`", scan_contract)
+        self.assertNotIn("`install_plan`", scan_contract)
+        self.assertNotIn("`quick_install_commands`", scan_contract)
+
 
 if __name__ == "__main__":
     unittest.main()

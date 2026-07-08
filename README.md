@@ -22,9 +22,25 @@ python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
 
 如果缺 detector，安装当前 strict mode 依赖：
 
+| Tool | What it is | Gate role |
+|---|---|---|
+| `ruff` | Fast Python linter | Python 魔法数字检测，使用 Ruff `PLR2004` 补强内置 AST fallback。 |
+| `lizard` | Cyclomatic complexity analyzer | 函数圈复杂度检测，用于 `IMP_007`。 |
+| `eslint` | JavaScript and TypeScript linter | JS/TS 魔法数字检测，使用 `no-magic-numbers`。 |
+
 ```bash
-python3 -m pip install ruff lizard
+python3 -m pip install --upgrade ruff lizard
 npm install -g eslint
+```
+
+安全边界：这些命令只供人工确认后执行；adapter 或安装器不得静默执行。使用 PyPI/npm、
+组织批准的内部镜像或 pinned/approved toolchain；不要使用 `curl | sh` 式安装脚本；如果不允许
+global npm install，或目标环境不是 macOS/Linux shell，就在项目或受控工具环境中使用等价安装方式，
+并确保 `eslint` 在 hook 的 `PATH` 中。
+安装后必须重跑：
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
 ```
 
 再跑最小验证：

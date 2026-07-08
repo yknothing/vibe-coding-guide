@@ -422,6 +422,29 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 self.assertIn(field, issue)
             self.assertEqual(issue["severity"], "M")
 
+    def test_scan_report_does_not_include_doctor_only_install_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "clean.py"
+            target.write_text("MAX_RETRIES = 3\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, str(HOOK), "--format", "json", "--files", str(target)],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["schema_version"], "quality-gate-report/v1")
+            self.assertNotIn("tool_catalog", payload)
+            self.assertNotIn("install_plan", payload)
+            self.assertNotIn("quick_install_commands", payload)
+            for detector in payload["detectors"].values():
+                self.assertNotIn("install", detector)
+
     def test_json_max_issues_does_not_truncate_structured_issues(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -875,6 +898,88 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertIn("detector.ruff", failed_checks)
             self.assertIn("detector.eslint", failed_checks)
             self.assertIn("detector.lizard", failed_checks)
+
+    def test_doctor_json_explains_missing_detector_install_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": "/nonexistent"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            install_plan = {item["tool"]: item for item in report["install_plan"]}
+            self.assertEqual(set(install_plan), {"ruff", "eslint", "lizard"})
+            self.assertEqual(
+                report["quick_install_commands"],
+                [
+                    "python3 -m pip install --upgrade ruff lizard",
+                    "npm install -g eslint",
+                ],
+            )
+            for detector in ["ruff", "eslint", "lizard"]:
+                self.assertIn("description", install_plan[detector])
+                self.assertIn("purpose", install_plan[detector])
+                self.assertIn("install_command", install_plan[detector])
+                self.assertIn("verify_command", install_plan[detector])
+                self.assertIn("security_note", install_plan[detector])
+                self.assertIn("curl | sh", install_plan[detector]["security_note"])
+            self.assertIn("Python", install_plan["ruff"]["description"])
+            self.assertIn("magic", install_plan["ruff"]["purpose"])
+            self.assertEqual(
+                install_plan["lizard"]["install_command"],
+                "python3 -m pip install --upgrade lizard",
+            )
+            self.assertIn("cyclomatic complexity", install_plan["lizard"]["purpose"])
+            self.assertEqual(install_plan["eslint"]["install_command"], "npm install -g eslint")
+            self.assertIn("JavaScript", install_plan["eslint"]["description"])
+
+    def test_doctor_text_explains_safe_detector_install_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--require-tools",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": "/nonexistent"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Install missing detector tools:", result.stderr)
+            self.assertIn("ruff: Fast Python linter", result.stderr)
+            self.assertIn("python3 -m pip install --upgrade ruff", result.stderr)
+            self.assertIn("lizard: Cyclomatic complexity analyzer", result.stderr)
+            self.assertIn("python3 -m pip install --upgrade lizard", result.stderr)
+            self.assertIn("eslint: JavaScript and TypeScript linter", result.stderr)
+            self.assertIn("npm install -g eslint", result.stderr)
+            self.assertIn("Do not use curl | sh", result.stderr)
+            self.assertIn("Manual commands only", result.stderr)
+            self.assertIn("Rerun --doctor --require-tools", result.stderr)
 
     def test_doctor_warns_about_missing_detectors_without_strict_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

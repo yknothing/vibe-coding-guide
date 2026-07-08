@@ -29,11 +29,31 @@ mode treats missing `ruff`, `eslint`, or `lizard` as `fail`; do not enable
 
 ## Claude Code Setup
 
-Install the detector tools first:
+Install the detector tools first. `--doctor` reports the same information in
+`install_plan` so adapters can show it before enabling strict mode.
+
+| Tool | What it is | Gate role |
+|---|---|---|
+| `ruff` | Fast Python linter | Detects Python magic numeric literals through Ruff `PLR2004`. |
+| `lizard` | Cyclomatic complexity analyzer | Measures function complexity for `IMP_007`. |
+| `eslint` | JavaScript and TypeScript linter | Detects JS/TS magic numeric literals with `no-magic-numbers`. |
 
 ```bash
-python3 -m pip install ruff lizard
+python3 -m pip install --upgrade ruff lizard
 npm install -g eslint
+```
+
+These commands are for manual confirmation only; adapters and installers must
+not run them without explicit user approval. Use PyPI/npm, approved internal
+mirrors, or a pinned/approved toolchain. Do not use `curl | sh` installers.
+If global npm installs are blocked, or the target environment is not a
+macOS/Linux shell, install ESLint in the project or approved tool environment
+with an equivalent command and make sure the hook process can find `eslint` on
+`PATH`.
+Verify the setup before enabling the hook:
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
 ```
 
 Then add this project-scoped hook to `.claude/settings.json`:
