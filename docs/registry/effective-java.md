@@ -14,21 +14,21 @@
 | Item 10/11/12：覆盖 equals/hashCode/toString 的契约 | 三章手写规则，历史上错误率极高 | Java 16 records 直接生成正确实现——**三个条目整体退役** |
 | Item 42–44：优先 lambda 与方法引用 | 匿名类样板 | Java 8 语言特性 |
 | Item 55：审慎返回 Optional | null 约定 | 类型系统承载"可能缺席"语义 |
-| Item 34–38：用枚举替代 int 常量 | 命名纪律 | Java 5 枚举 + sealed（Java 17）承载受限类型集 |
+| Item 34–38：用枚举替代 int 常量 | 命名纪律 | Java 5 枚举吸收枚举相关纪律；Java 17 sealed 是现代 Java 对受限类型集的补充机制 |
 
-**观察**：语言吸收是终极编译——被吸收的条目不再需要任何人（或 Agent）"记得"，违反变得不可表达。这就是"技术栈选择 = 预编译份额选择"的实证：**选 Java 21 而不是 Java 8，等于免费获得约十个 Effective Java 条目的自动执行。**
+**观察**：语言吸收是终极编译——被吸收的条目不再需要任何人（或 Agent）"记得"，违反变得不可表达。这就是"技术栈选择 = 预编译份额选择"的实证：**选 Java 21 而不是 Java 8，会让多个 Effective Java 条目的机械部分由语言或标准库直接承担**。
 
 ### 第二波：工具吸收（L2–L3）
 
 | 条目 | 吸收工具 |
 |---|---|
-| Item 40：坚持使用 @Override | Error Prone `MissingOverride`——编译期报错 |
-| equals/hashCode 成对契约（存量代码） | Error Prone `EqualsHashCode` |
+| Item 40：坚持使用 @Override | Error Prone `MissingOverride`（默认 `WARNING`，可由构建配置升级为失败） |
+| Item 11：equals/hashCode 成对契约（存量代码） | Error Prone `EqualsHashCode` |
 | null 纪律（Item 54/55 周边） | NullAway / Checker Framework——把 null 安全提升到类型层 |
-| Item 17：最小化可变性 | Immutables/records + Error Prone `Immutable` 检查 |
+| Item 17：最小化可变性 | Immutables/records + Error Prone `Immutable` 对标注为 `@Immutable` 的类型做深不可变性检查 |
 | Item 26–29：泛型与原生类型 | 编译器警告 + `-Werror` 门禁 |
 
-**观察**：Google 用 Error Prone 把书"安装"进了构建系统——工程师不再需要读过这本书才能遵守它。这正是本登记册要对判断层复刻的事。
+**观察**：Error Prone、NullAway、Checker Framework 等工具覆盖或呼应了若干 Effective Java 机械条目，是经典规则工具化的历史先例；但它们不是整本书的完整实现，也不能替代 API 设计品味。这正是本登记册要对判断层继续推进的事。
 
 ### 第三波：待编译的判断层（L5–L6——本登记册的工作面）
 
