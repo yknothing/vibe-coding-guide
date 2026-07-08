@@ -25,7 +25,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from tools.rule_loader import Rule, RuleValidationError, load_rules
+from tools.rule_loader import Rule, RuleValidationError, load_rules  # noqa: E402
 
 
 RULE_VERSION = "2025.v1.0.cn"
@@ -141,6 +141,12 @@ NUMERIC_LITERAL_RE = re.compile(
 URL_LITERAL_RE = re.compile(
     r"""(?P<quote>['"])(?P<value>(?:https?://|localhost(?::\d+)?|(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?)[^'"]*)(?P=quote)"""
 )
+LIZARD_CSV_CCN_INDEX = 1
+LIZARD_CSV_LOCATION_INDEX = 5
+LIZARD_CSV_FILE_INDEX = 6
+LIZARD_CSV_FUNCTION_INDEX = 7
+LIZARD_CSV_START_LINE_INDEX = 9
+LIZARD_CSV_MIN_COLUMNS = LIZARD_CSV_FUNCTION_INDEX + 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1384,15 +1390,19 @@ def parse_lizard_csv(output: str) -> list[dict[str, str]]:
 
     rows: list[dict[str, str]] = []
     for columns in csv.reader(io.StringIO(output)):
-        if len(columns) < 8:
+        if len(columns) < LIZARD_CSV_MIN_COLUMNS:
             continue
         rows.append(
             {
-                "CCN": columns[1],
-                "location": columns[5],
-                "file": columns[6],
-                "function": columns[7],
-                "start_line": columns[9] if len(columns) > 9 else columns[5],
+                "CCN": columns[LIZARD_CSV_CCN_INDEX],
+                "location": columns[LIZARD_CSV_LOCATION_INDEX],
+                "file": columns[LIZARD_CSV_FILE_INDEX],
+                "function": columns[LIZARD_CSV_FUNCTION_INDEX],
+                "start_line": (
+                    columns[LIZARD_CSV_START_LINE_INDEX]
+                    if len(columns) > LIZARD_CSV_START_LINE_INDEX
+                    else columns[LIZARD_CSV_LOCATION_INDEX]
+                ),
             }
         )
     return rows

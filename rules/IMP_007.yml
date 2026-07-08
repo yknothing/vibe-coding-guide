@@ -4,7 +4,7 @@ sev: "H"
 cat: "IMP"
 lang: ["*"]
 state: "P"
-met: {"type": "cognitive_complexity_check", "expr": {"cognitive_complexity_score": ">15", "or_combined_score_loc_nesting_params": ">Y"}, "cfg_key": "MAX_COGNITIVE_SCORE_IMP_X3"}
+met: {"type": "cyclomatic_complexity_check", "expr": {"cyclomatic_complexity": ">10"}, "cfg_key": "MAX_CYCLOMATIC_COMPLEXITY_IMP_007"}
 det: [{"tool": "lzd", "rule": "cyclomatic_complexity_threshold"}, {"tool": "sa", "rule": "python_ast_complexity_fallback"}]
 act: "RCM"
 autofix: {"type": "manual_assist"}
