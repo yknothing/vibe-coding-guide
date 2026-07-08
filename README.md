@@ -18,12 +18,12 @@ docs/
     legacy-code.md            《修改代码的艺术》：遗留代码手术规程
     refactoring.md            《重构》：两顶帽子、小步绿灯、坏味道分拣
     tdd.md                    《测试驱动开发》：红灯实证、测试清单、三角化
-for-ai/                       v1 遗产（执行层定位已被 STRATEGY.md 否定，schema 骨架被登记册复用）
+for-ai/                       v1 遗产（反例标本 + schema 骨架；执行层定位已被 STRATEGY.md 否定）
   rules/code_review_rules.md  v1 规则集：90 条单体规则（作为反例标本保留）
   rules/issue.schema.json     v1 输出契约（后续对齐 SARIF）
   index.jsonl                 空占位文件，待重构时清理
 hooks/                        首个可运行 PostToolUse 质量门禁原型
-rules/                        首批拆分出的单规则 YAML（IMP_004 / MNT_001 / IMP_007）
+rules/                        首批迁移并接线的单规则 YAML（IMP_004 / MNT_001 / IMP_007）
 tests/                        标准库回归测试，覆盖 hook、规则校验、fail-closed 语义
 tools/                        规则加载与校验工具（无第三方依赖）
 ```
@@ -57,4 +57,4 @@ python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.p
 
 ## 当前状态
 
-文档与方法论先行阶段。门禁 / hook / skill 的工程实现按登记册各书的"实现优先级建议"推进；本仓库的文档语料自身也受登记册第 5 节"反身性"条款约束（不引用不存在的工件、合并前经干净上下文对抗性评审）。
+文档与方法论先行阶段。`for-ai/rules/` 保留为 v1 反例标本与 schema 来源，真实可执行规则迁移到顶层 `rules/` 后才算接线。门禁 / hook / skill 的工程实现按登记册各书的"实现优先级建议"推进；本仓库的文档语料自身也受登记册第 5 节"反身性"条款约束（不引用不存在的工件、合并前经干净上下文对抗性评审）。
