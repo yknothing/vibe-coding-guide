@@ -1,0 +1,12 @@
+id: "IMP_004"
+lvl: "M"
+sev: "M"
+cat: "IMP"
+lang: ["*"]
+state: "P"
+met: {"type": "magic_value_check", "expr": {"unexplained_literal_found": true, "not_in_constant_definition": true, "literal_type_pattern": "(numeric|string|boolean)"}}
+det: [{"tool": "rfk", "rule": "PLR2004"}, {"tool": "esl", "rule": "no-magic-numbers"}, {"tool": "sa", "rule": "numeric_literal_scan"}]
+act: "FIX"
+autofix: {"type": "ai_patch"}
+gate: {"detector": "magic_numeric_literal", "allow_token": "ALLOW_MAGIC_NUMBER:", "ignored_numbers": ["-1", "0", "1", "0.0", "1.0"]}
+rat: "魔法值硬编码 -> 代码晦涩难懂 维护时易引入新错误 配置管理困难 ; #可读性 #可维护性"
