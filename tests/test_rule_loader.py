@@ -19,7 +19,8 @@ class RuleLoaderTests(unittest.TestCase):
     def test_loads_split_rules(self) -> None:
         rules = load_rules(RULES_DIR)
 
-        self.assertEqual(set(rules), {"IMP_004", "IMP_007", "MNT_001", "MNT_002"})
+        self.assertEqual(set(rules), {"DSN_001", "IMP_004", "IMP_007", "MNT_001", "MNT_002"})
+        self.assertEqual(rules["DSN_001"].cat, "DSN")
         self.assertEqual(rules["IMP_004"].act, "FIX")
         self.assertEqual(rules["IMP_007"].sev, "H")
         self.assertEqual(rules["MNT_001"].cat, "MNT")
@@ -35,6 +36,8 @@ class RuleLoaderTests(unittest.TestCase):
                 str(VALIDATE),
                 str(RULES_DIR),
                 "--require",
+                "DSN_001",
+                "--require",
                 "IMP_004",
                 "--require",
                 "IMP_007",
@@ -49,7 +52,7 @@ class RuleLoaderTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("validated 4 rule(s)", result.stdout)
+        self.assertIn("validated 5 rule(s)", result.stdout)
 
     def test_validate_rules_cli_runs_without_site_packages(self) -> None:
         result = subprocess.run(
@@ -60,7 +63,7 @@ class RuleLoaderTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("validated 4 rule(s)", result.stdout)
+        self.assertIn("validated 5 rule(s)", result.stdout)
 
     def test_missing_met_fails_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

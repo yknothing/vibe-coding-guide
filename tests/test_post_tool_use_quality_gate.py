@@ -220,6 +220,72 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["issues"], [])
 
+    def test_python_pass_through_method_reports_design_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "service.py"
+            target.write_text(
+                textwrap.dedent(
+                    """
+                    class UserService:
+                        def __init__(self, repository):
+                            self.repository = repository
+
+                        def get_user(self, user_id):
+                            return self.repository.get_user(user_id)
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(HOOK), "--format", "json", "--files", str(target)],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            payload = json.loads(result.stdout)
+            design_issues = [issue for issue in payload["issues"] if issue["rule_id"] == "DSN_001"]
+            self.assertEqual(len(design_issues), 1)
+            self.assertIn("get_user", design_issues[0]["message"])
+
+    def test_python_method_with_boundary_logic_is_not_pass_through(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "service.py"
+            target.write_text(
+                textwrap.dedent(
+                    """
+                    class UserService:
+                        def __init__(self, repository):
+                            self.repository = repository
+
+                        def get_user(self, user_id):
+                            if user_id is None:
+                                return None
+                            return self.repository.get_user(user_id)
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(HOOK), "--format", "json", "--files", str(target)],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["issues"], [])
+
     def test_constant_defined_hardcoded_url_still_reports_configuration_issue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -320,7 +386,10 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(payload["gate"], "post_tool_use_quality_gate")
             self.assertEqual(payload["status"], "fail")
             self.assertEqual(payload["scanned_files"], ["bad.py"])
-            self.assertEqual(set(payload["rules_loaded"]), {"IMP_004", "IMP_007", "MNT_001", "MNT_002"})
+            self.assertEqual(
+                set(payload["rules_loaded"]),
+                {"DSN_001", "IMP_004", "IMP_007", "MNT_001", "MNT_002"},
+            )
             self.assertEqual(payload["ratchet"]["status"], "not_configured")
             self.assertEqual(payload["summary"]["issue_count"], len(payload["issues"]))
             self.assertEqual(payload["summary"]["ratchet_violation_count"], 0)

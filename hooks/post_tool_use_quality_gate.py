@@ -598,6 +598,80 @@ def scan_python_public_api_docstrings(path: Path, root: Path) -> list[Issue]:
     return issues
 
 
+def body_without_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+    body = list(node.body)
+    if not body:
+        return body
+    first = body[0]
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+        return body[1:]
+    return body
+
+
+def function_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    parameters = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args]]
+    if parameters and parameters[0] in {"self", "cls"}:
+        parameters = parameters[1:]
+    return parameters
+
+
+def delegated_call_from_statement(statement: ast.stmt) -> ast.Call | None:
+    if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Call):
+        return statement.value
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        return statement.value
+    return None
+
+
+def is_pure_pass_through_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    body = body_without_docstring(node)
+    if len(body) != 1:
+        return False
+    call = delegated_call_from_statement(body[0])
+    if call is None or call.keywords:
+        return False
+    parameters = function_parameter_names(node)
+    if not parameters or len(call.args) != len(parameters):
+        return False
+    call_arg_names = [arg.id for arg in call.args if isinstance(arg, ast.Name)]
+    return call_arg_names == parameters
+
+
+def scan_python_pass_through_functions(path: Path, root: Path) -> list[Issue]:
+    if path.suffix not in PYTHON_EXTENSIONS:
+        return []
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+
+    issues: list[Issue] = []
+    rel = relative_path(path, root)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not is_pure_pass_through_function(node):
+            continue
+        issues.append(
+            Issue(
+                rule_id="DSN_001",
+                severity="L",
+                category="DSN",
+                file_path=rel,
+                start_line=node.lineno,
+                end_line=getattr(node, "end_lineno", node.lineno),
+                message=f"Function `{node.name}` only delegates its parameters to another call.",
+                detailed_explanation=(
+                    "纯透传函数通常说明当前抽象层没有增加设计价值；"
+                    "请合并这一层，或补充它承担的语义、边界处理或信息隐藏职责。"
+                ),
+                suggested_action="RCM",
+                metric_values={"detector": "python_ast_pass_through_function"},
+            )
+        )
+    return issues
+
+
 def python_complexity_metrics(path: Path) -> dict[str, int]:
     metrics = {
         "python_function_count": 0,
@@ -988,6 +1062,7 @@ def scan_files(
     for path in files:
         issues.extend(scan_magic_values_builtin(path, root))
         issues.extend(scan_python_public_api_docstrings(path, root))
+        issues.extend(scan_python_pass_through_functions(path, root))
         if not lizard_available and path.suffix in PYTHON_EXTENSIONS:
             issues.extend(scan_python_complexity_builtin(path, root, threshold))
 
