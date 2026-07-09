@@ -19,13 +19,13 @@
 
 ## Batch A: Normalize Adapter Requests
 
-- [ ] Add failing tests for `--hook --files`, non-object hook JSON, invalid hook `cwd`, relative baseline resolution, and source truth.
-- [ ] Add immutable `QualityGateRequest` with schema version, root, candidate files, source, tool name, baseline, strict flag, and optional threshold override/source.
-- [ ] Add thin Generic CLI and Claude projection functions. Keep `collect_path_values` inside the Claude projection boundary.
-- [ ] Make `main` consume only the normalized request for file resolution, ratchet, scan settings, and report source.
-- [ ] Preserve current direct and hook behavior for valid inputs.
-- [ ] Run focused tests, full suite, Ruff, compile, rule validation, diff check, and non-author review.
-- [ ] Commit Batch A independently.
+- [x] Add failing tests for `--hook --files`, non-object hook JSON, invalid hook `cwd`, relative baseline resolution, and source truth.
+- [x] Add immutable `QualityGateRequest` with schema version, root, candidate files, source, tool name, baseline, strict flag, and optional threshold override/source.
+- [x] Add thin Generic CLI and Claude projection functions. Keep `collect_path_values` inside the Claude projection boundary.
+- [x] Make `main` consume only the normalized request for file resolution, ratchet, scan settings, and report source.
+- [x] Preserve current direct and hook behavior for valid inputs.
+- [x] Run focused tests, full suite, Ruff, compile, rule validation, diff check, and non-author review.
+- [x] Commit Batch A independently.
 
 ## Batch B: Make Policy Executable
 

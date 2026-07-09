@@ -116,6 +116,10 @@ JSON output is a stable wrapper with `schema_version`, `status`, `timestamp`,
 `run_id`, `duration_ms`, `source`, `detectors`, `scanned_files`, `skipped_files`,
 `rules_loaded`, `metrics`, `ratchet`, `issues`, `tool_errors`, and `summary`.
 Individual `issues` keep the required fields from `for-ai/rules/issue.schema.json`.
+Generic CLI and Claude PostToolUse inputs are normalized through
+`quality-gate-request/v1`; the report records that version in
+`source.request_schema_version`. `--hook` and `--files` are mutually exclusive,
+and relative baseline paths resolve from the normalized project root.
 Each detector records the current run under `detectors.<name>.run`, including
 `status` (`succeeded`, `not_applicable`, `missing`, `failed`, or `ignored`),
 `coverage` (`complete`, `fallback`, or `none`), files, the fallback name, and

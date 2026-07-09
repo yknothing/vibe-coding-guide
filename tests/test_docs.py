@@ -68,6 +68,17 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("TypeScript ignored", combined)
         self.assertIn("uncovered_files", combined)
 
+    def test_docs_explain_normalized_request_boundary(self) -> None:
+        hook_readme = (ROOT / "hooks" / "README.md").read_text(encoding="utf-8")
+        adapters = (ROOT / "docs" / "ADAPTERS.md").read_text(encoding="utf-8")
+        combined = "\n".join([hook_readme, adapters])
+
+        self.assertIn("quality-gate-request/v1", combined)
+        self.assertIn("request_schema_version", combined)
+        self.assertIn("`--hook`", combined)
+        self.assertIn("`--files`", combined)
+        self.assertIn("mutually exclusive", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

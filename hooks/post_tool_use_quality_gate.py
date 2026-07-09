@@ -32,6 +32,7 @@ from tools.rule_loader import Rule, RuleValidationError, load_rules  # noqa: E40
 RULE_VERSION = "2025.v1.0.cn"
 REPORT_SCHEMA_VERSION = "quality-gate-report/v1"
 DOCTOR_SCHEMA_VERSION = "quality-gate-doctor/v1"
+REQUEST_SCHEMA_VERSION = "quality-gate-request/v1"
 TOOL_TIMEOUT_SECONDS = 30
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
 REQUIRED_DETECTORS = ("ruff", "eslint", "lizard")
@@ -231,6 +232,29 @@ class DetectorOutcome:
         return dataclasses.asdict(self)
 
 
+@dataclasses.dataclass(frozen=True)
+class QualityGateRequest:
+    schema_version: str
+    root: Path
+    files: tuple[str, ...]
+    mode: str
+    adapter: str
+    hook_event_name: str | None
+    tool_name: str | None
+    baseline_path: Path | None
+    strict: bool
+    complexity_threshold: int
+
+    def source_schema(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "adapter": self.adapter,
+            "hook_event_name": self.hook_event_name,
+            "tool_name": self.tool_name,
+            "request_schema_version": self.schema_version,
+        }
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scan PostToolUse-edited files for magic values and complexity."
@@ -295,9 +319,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def load_hook_event() -> dict[str, Any]:
     try:
-        return json.load(sys.stdin)
+        event = json.load(sys.stdin)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid hook JSON: {exc}") from exc
+    if not isinstance(event, dict):
+        raise ValueError("Hook JSON must be an object.")
+    return event
 
 
 def apply_rule_metadata(issues: list[Issue], rules: dict[str, Rule]) -> list[Issue]:
@@ -330,6 +357,114 @@ def determine_root(args: argparse.Namespace, event: dict[str, Any] | None) -> Pa
     if raw_root is None and event is not None:
         raw_root = event.get("cwd")
     return Path(raw_root or os.getcwd()).expanduser().resolve()
+
+
+def request_root(
+    args: argparse.Namespace,
+    event: dict[str, Any] | None,
+    process_cwd: Path,
+) -> tuple[Path, list[ToolError]]:
+    errors: list[ToolError] = []
+    event_root = event.get("cwd") if event is not None else None
+    if event_root is not None and (
+        not isinstance(event_root, str) or not event_root.strip()
+    ):
+        errors.append(
+            ToolError("hook-input", "Hook `cwd` must be a non-empty string when present.")
+        )
+        event_root = None
+    raw_root = args.root or os.environ.get("CLAUDE_PROJECT_DIR") or event_root
+    try:
+        root = Path(raw_root or process_cwd).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        errors.append(ToolError("hook-input", f"Project root could not be resolved: {exc}"))
+        root = process_cwd.resolve()
+    return root, errors
+
+
+def request_baseline_path(raw_path: Path | None, root: Path) -> Path | None:
+    if raw_path is None:
+        return None
+    path = raw_path.expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve(strict=False)
+
+
+def event_string(
+    event: dict[str, Any] | None,
+    key: str,
+    errors: list[ToolError],
+) -> str | None:
+    if event is None or event.get(key) is None:
+        return None
+    value = event[key]
+    if not isinstance(value, str):
+        errors.append(ToolError("hook-input", f"Hook `{key}` must be a string when present."))
+        return None
+    return value
+
+
+def claude_candidate_paths(
+    event: dict[str, Any] | None,
+    root: Path,
+    tool_name: str | None,
+    errors: list[ToolError],
+) -> list[str]:
+    if event is None:
+        return []
+    raw_paths = collect_path_values(event.get("tool_input", {}))
+    if tool_name == "Bash" and not raw_paths:
+        return git_changed_files(root)
+    if tool_name in EDIT_TOOLS and not raw_paths:
+        errors.append(
+            ToolError(
+                "hook-input",
+                f"PostToolUse payload for {tool_name} did not include a file path to scan.",
+            )
+        )
+    return raw_paths
+
+
+def build_quality_gate_request(
+    args: argparse.Namespace,
+    event: dict[str, Any] | None,
+    process_cwd: Path,
+) -> tuple[QualityGateRequest, list[ToolError]]:
+    root, errors = request_root(args, event, process_cwd)
+    hook_event_name = event_string(event, "hook_event_name", errors)
+    tool_name = event_string(event, "tool_name", errors)
+    conflict = args.hook and args.files is not None
+
+    if conflict:
+        errors.append(ToolError("hook-input", "--hook and --files cannot be used together."))
+        mode = "invalid"
+        adapter = "invalid-mixed-input"
+        raw_files: list[str] = []
+    elif args.hook:
+        mode = "hook"
+        adapter = "claude-code-post-tool-use"
+        raw_files = claude_candidate_paths(event, root, tool_name, errors)
+    else:
+        mode = "direct_files"
+        adapter = "generic-cli"
+        raw_files = list(args.files or [])
+        if args.files is None:
+            errors.append(ToolError("hook-input", "No --files provided and --hook was not set."))
+
+    request = QualityGateRequest(
+        schema_version=REQUEST_SCHEMA_VERSION,
+        root=root,
+        files=tuple(raw_files),
+        mode=mode,
+        adapter=adapter,
+        hook_event_name=hook_event_name,
+        tool_name=tool_name,
+        baseline_path=request_baseline_path(args.ratchet_baseline, root),
+        strict=args.require_tools,
+        complexity_threshold=args.complexity_threshold,
+    )
+    return request, errors
 
 
 def collect_path_values(value: Any, key_hint: str = "") -> list[str]:
@@ -445,20 +580,8 @@ def quick_install_commands(install_plan: list[dict[str, str]]) -> list[str]:
     return commands
 
 
-def report_source(args: argparse.Namespace, event: dict[str, Any] | None) -> dict[str, Any]:
-    if args.hook:
-        return {
-            "mode": "hook",
-            "adapter": "claude-code-post-tool-use",
-            "hook_event_name": event.get("hook_event_name") if event else None,
-            "tool_name": event.get("tool_name") if event else None,
-        }
-    return {
-        "mode": "direct_files",
-        "adapter": "generic-cli",
-        "hook_event_name": None,
-        "tool_name": None,
-    }
+def report_source(request: QualityGateRequest) -> dict[str, Any]:
+    return request.source_schema()
 
 
 def doctor_status(checks: list[DoctorCheck]) -> str:
@@ -690,25 +813,6 @@ def resolve_scan_files(raw_paths: list[str], root: Path) -> tuple[list[Path], li
 def normalize_scan_files(raw_paths: list[str], root: Path) -> list[Path]:
     files, _ = resolve_scan_files(raw_paths, root)
     return files
-
-
-def event_scan_files(event: dict[str, Any], root: Path) -> tuple[list[Path], list[SkippedFile], list[ToolError]]:
-    tool_name = str(event.get("tool_name", ""))
-    raw_paths = collect_path_values(event.get("tool_input", {}))
-    errors: list[ToolError] = []
-
-    if tool_name == "Bash" and not raw_paths:
-        raw_paths = git_changed_files(root)
-    elif tool_name in EDIT_TOOLS and not raw_paths:
-        errors.append(
-            ToolError(
-                "hook-input",
-                f"PostToolUse payload for {tool_name} did not include a file path to scan.",
-            )
-        )
-
-    files, skipped = resolve_scan_files(raw_paths, root)
-    return files, skipped, errors
 
 
 def relative_path(path: Path, root: Path) -> str:
@@ -1995,7 +2099,9 @@ def main(argv: list[str]) -> int:
         except ValueError as exc:
             input_errors.append(ToolError("hook-input", str(exc)))
 
-    root = determine_root(args, event)
+    request, request_errors = build_quality_gate_request(args, event, Path.cwd())
+    input_errors.extend(request_errors)
+    root = request.root
     rule_errors: list[ToolError] = []
     rules: dict[str, Rule] = {}
     try:
@@ -2003,20 +2109,13 @@ def main(argv: list[str]) -> int:
     except RuleValidationError as exc:
         rule_errors.append(ToolError("rule-config", str(exc)))
 
-    skipped_files: list[SkippedFile] = []
-    if args.files is not None:
-        files, skipped_files = resolve_scan_files(args.files, root)
-    elif event is not None:
-        files, skipped_files, input_errors = event_scan_files(event, root)
-    else:
-        input_errors.append(ToolError("hook-input", "No --files provided and --hook was not set."))
-        files = []
+    files, skipped_files = resolve_scan_files(list(request.files), root)
 
     metrics = collect_quality_metrics(files, root)
-    ratchet, ratchet_errors = evaluate_ratchet(metrics, args.ratchet_baseline)
+    ratchet, ratchet_errors = evaluate_ratchet(metrics, request.baseline_path)
     detectors = detector_inventory()
     issues, tool_errors, detector_outcomes = scan_files(
-        files, root, args.complexity_threshold, args.require_tools
+        files, root, request.complexity_threshold, request.strict
     )
     for detector, outcome in detector_outcomes.items():
         detectors[detector]["run"] = outcome.to_schema()
@@ -2034,7 +2133,7 @@ def main(argv: list[str]) -> int:
             )
         issues = apply_rule_metadata(issues, rules)
 
-    source = report_source(args, event)
+    source = report_source(request)
     report = build_report(
         issues,
         all_errors,

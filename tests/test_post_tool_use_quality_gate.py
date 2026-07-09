@@ -11,6 +11,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,7 +56,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
     def run_hook(
         self,
         workspace: Path,
-        payload: dict[str, object],
+        payload: object,
         *args: str,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -72,6 +73,217 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             text=True,
             check=False,
         )
+
+    def test_hook_and_files_conflict_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            payload = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "cwd": str(workspace),
+                "tool_input": {"file_path": "clean.py"},
+            }
+
+            result = self.run_hook(
+                workspace,
+                payload,
+                "--format",
+                "json",
+                "--files",
+                str(target),
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("hook-input", {error["tool"] for error in report["tool_errors"]})
+            self.assertEqual(report["source"]["mode"], "invalid")
+
+    def test_non_object_hook_json_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+
+            result = self.run_hook(
+                workspace,
+                [],
+                "--format",
+                "json",
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("hook-input", {error["tool"] for error in report["tool_errors"]})
+
+    def test_invalid_hook_cwd_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            payload = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "cwd": [],
+                "tool_input": {"file_path": "clean.py"},
+            }
+
+            result = self.run_hook(
+                workspace,
+                payload,
+                "--format",
+                "json",
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("hook-input", {error["tool"] for error in report["tool_errors"]})
+
+    def test_invalid_hook_tool_name_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            payload = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": [],
+                "cwd": str(workspace),
+                "tool_input": {},
+            }
+
+            result = self.run_hook(
+                workspace,
+                payload,
+                "--format",
+                "json",
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("hook-input", {error["tool"] for error in report["tool_errors"]})
+
+    def test_request_root_precedence_is_explicit_env_event_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            explicit_root = workspace / "explicit"
+            env_root = workspace / "env"
+            event_root = workspace / "event"
+            process_root = workspace / "process"
+            module = load_hook_module()
+            event = {"cwd": str(event_root)}
+
+            explicit_args = module.parse_args(
+                ["--hook", "--root", str(explicit_root)]
+            )
+            env_args = module.parse_args(["--hook"])
+            with mock.patch.dict(
+                os.environ, {"CLAUDE_PROJECT_DIR": str(env_root)}, clear=False
+            ):
+                explicit_request, _ = module.build_quality_gate_request(
+                    explicit_args, event, process_root
+                )
+                env_request, _ = module.build_quality_gate_request(
+                    env_args, event, process_root
+                )
+            with mock.patch.dict(os.environ, {}, clear=True):
+                event_request, _ = module.build_quality_gate_request(
+                    env_args, event, process_root
+                )
+                process_request, _ = module.build_quality_gate_request(
+                    env_args, {}, process_root
+                )
+
+            self.assertEqual(explicit_request.root, explicit_root)
+            self.assertEqual(env_request.root, env_root)
+            self.assertEqual(event_request.root, event_root)
+            self.assertEqual(process_request.root, process_root)
+
+    def test_relative_baseline_resolves_from_explicit_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            launch_dir = workspace / "launch"
+            launch_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            baseline = workspace / "baseline.json"
+            baseline.write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "files": {
+                                "clean.py": {
+                                    "magic_literal_count": 0,
+                                    "hardcoded_endpoint_count": 0,
+                                    "python_max_cyclomatic_complexity": 0,
+                                }
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--root",
+                str(workspace),
+                "--ratchet-baseline",
+                "baseline.json",
+                env={"PATH": "/nonexistent"},
+                process_cwd=launch_dir,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["ratchet"]["status"], "pass")
+            self.assertEqual(report["ratchet"]["baseline"], str(baseline.resolve()))
+
+    def test_cli_and_claude_project_to_equivalent_execution_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            module = load_hook_module()
+            common_args = [
+                "--root",
+                str(workspace),
+                "--ratchet-baseline",
+                "baseline.json",
+                "--complexity-threshold",
+                "7",
+                "--require-tools",
+            ]
+            cli_args = module.parse_args([*common_args, "--files", "clean.py"])
+            hook_args = module.parse_args([*common_args, "--hook"])
+            event = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "cwd": str(workspace),
+                "tool_input": {"file_path": "clean.py"},
+            }
+
+            cli_request, cli_errors = module.build_quality_gate_request(
+                cli_args, None, workspace
+            )
+            hook_request, hook_errors = module.build_quality_gate_request(
+                hook_args, event, workspace
+            )
+
+            self.assertEqual(cli_errors, [])
+            self.assertEqual(hook_errors, [])
+            for field in [
+                "schema_version",
+                "root",
+                "files",
+                "baseline_path",
+                "strict",
+                "complexity_threshold",
+            ]:
+                self.assertEqual(getattr(cli_request, field), getattr(hook_request, field))
+            self.assertEqual(cli_request.adapter, "generic-cli")
+            self.assertEqual(hook_request.adapter, "claude-code-post-tool-use")
 
     def run_files(
         self,

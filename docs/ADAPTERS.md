@@ -21,14 +21,17 @@
 所有 adapter 最终都应提供这些字段；拿不到的字段必须显式为 `null` 或省略后由 core
 标记为 unavailable，不得编造。
 
+当前内部规范化契约版本是 `quality-gate-request/v1`。Generic CLI 与 Claude Code
+PostToolUse 都必须先投影成这一请求对象，scan core 不直接解释原始 adapter payload。
+
 | 字段 | 必需 | 说明 |
 |---|---|---|
-| `cwd` | 是 | 项目根目录。所有相对路径都基于它解析。 |
+| `cwd` | 是 | 规范化后的绝对项目根目录。文件和 baseline 的相对路径都基于它解析。 |
 | `files` | 是 | 本轮要扫描的文件列表。hook 无法直接给出时，可由 adapter 从 git diff/status 推导。 |
 | `event_source` | 是 | 事件来源，例如 `generic-cli`、`claude-code-post-tool-use`、`codex-cli`。 |
 | `tool_name` | 否 | IDE/CLI 暴露的工具名，例如 `Edit`、`Write`、`Bash`。 |
 | `baseline_path` | 否 | 棘轮 baseline JSON；没有时 report 必须是 `not_configured`。 |
-| `strict` | 是 | 是否要求本次扫描文件适用的外部 detector 成功。scan 是 profile-scoped；doctor strict 仍检查完整安装清单。 |
+| `strict` | 是 | 是否要求本次扫描文件适用的外部 detector 成功。它来自受信任 CLI 配置，原始 IDE 事件不得覆盖。 |
 | `adapter_metadata` | 否 | adapter 自己的版本、配置文件路径、触发器名称等。 |
 
 当前 core 的最小入口是：
@@ -37,6 +40,10 @@
 python3 hooks/post_tool_use_quality_gate.py --files path/to/file.py --format json
 python3 hooks/post_tool_use_quality_gate.py --hook --format json
 ```
+
+`--hook` 与 `--files` 互斥；混用会返回结构化 `hook-input` error，不能选择其中一个后仍
+宣称来自另一个入口。Claude 的宽松路径提取只存在于 Claude 投影层，不属于 core 规则。
+报告 `source.request_schema_version` 记录实际使用的规范化请求版本。
 
 `--doctor` 用来检查本机是否具备启用 strict gate 的条件：
 
