@@ -24,8 +24,11 @@ python3 hooks/post_tool_use_quality_gate.py --doctor --format json
 
 `--doctor` emits `quality-gate-doctor/v1`. Non-strict mode returns `warn` when
 external detectors are missing because fallback detectors can still run. Strict
-mode treats missing `ruff`, `eslint`, or `lizard` as `fail`; do not enable
+mode treats a missing applicable `ruff`, `eslint`, or `lizard` as `fail`; do not enable
 `--require-tools` in an adapter until doctor reports `strict_ready: true`.
+Doctor checks the complete installation inventory. A file scan is profile-scoped:
+strict mode requires only detectors applicable to the scanned file types, so a
+Python-only scan does not require ESLint.
 
 ## Claude Code Setup
 
@@ -36,7 +39,7 @@ Install the detector tools first. `--doctor` reports the same information in
 |---|---|---|
 | `ruff` | Fast Python linter | Detects Python magic numeric literals through Ruff `PLR2004`. |
 | `lizard` | Cyclomatic complexity analyzer | Measures function complexity for `IMP_007`. |
-| `eslint` | JavaScript and TypeScript linter | Detects JS/TS magic numeric literals with `no-magic-numbers`. |
+| `eslint` | JavaScript and TypeScript linter | Detects JavaScript magic numeric literals; TypeScript also needs a working parser/config. |
 
 ```bash
 python3 -m pip install --upgrade ruff lizard
@@ -77,10 +80,11 @@ Then add this project-scoped hook to `.claude/settings.json`:
 }
 ```
 
-`--require-tools` is intentional: in gate mode, missing Ruff, ESLint, or lizard
+`--require-tools` is intentional: an applicable detector that is missing or fails
 is treated as a setup failure instead of a green pass. The script still has
 built-in fallback detectors so the repository can run deterministic tests
-without installing those tools.
+without installing those tools. TypeScript ignored, parser, and configuration
+diagnostics remain errors because the literal fallback is not a TypeScript parser.
 
 `Bash` is included because shell commands can create or modify files without
 going through `Edit` / `Write` / `MultiEdit`. When a `Bash` payload does not
@@ -112,6 +116,13 @@ JSON output is a stable wrapper with `schema_version`, `status`, `timestamp`,
 `run_id`, `duration_ms`, `source`, `detectors`, `scanned_files`, `skipped_files`,
 `rules_loaded`, `metrics`, `ratchet`, `issues`, `tool_errors`, and `summary`.
 Individual `issues` keep the required fields from `for-ai/rules/issue.schema.json`.
+Each detector records the current run under `detectors.<name>.run`, including
+`status` (`succeeded`, `not_applicable`, `missing`, `failed`, or `ignored`),
+`coverage` (`complete`, `fallback`, or `none`), files, the fallback name, and
+`uncovered_files`. A non-empty `uncovered_files` list means the fallback did not
+cover every requested file and the run cannot pass.
+For zero-function files, an empty lizard CSV is accepted only after lizard's XML
+File measure explicitly confirms that the requested file was processed.
 
 `status: incomplete` means the gate did not scan any supported files, usually
 because every input path was unsupported, outside the project, duplicated, or

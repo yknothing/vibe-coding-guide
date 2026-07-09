@@ -56,6 +56,18 @@ class DocumentationTests(unittest.TestCase):
         self.assertNotIn("`install_plan`", scan_contract)
         self.assertNotIn("`quick_install_commands`", scan_contract)
 
+    def test_docs_explain_profile_scoped_detector_truth(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        hook_readme = (ROOT / "hooks" / "README.md").read_text(encoding="utf-8")
+        adapters = (ROOT / "docs" / "ADAPTERS.md").read_text(encoding="utf-8")
+        combined = "\n".join([readme, hook_readme, adapters])
+
+        self.assertIn("detectors.<name>.run", combined)
+        self.assertIn("not_applicable", combined)
+        self.assertIn("profile-scoped", combined)
+        self.assertIn("TypeScript ignored", combined)
+        self.assertIn("uncovered_files", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

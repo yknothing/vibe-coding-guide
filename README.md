@@ -20,13 +20,17 @@ python3 hooks/post_tool_use_quality_gate.py --doctor
 python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
 ```
 
+Doctor 的 strict 检查面向完整安装清单；实际 scan 的 `--require-tools` 是
+profile-scoped，只要求本次文件类型适用的 detector。例如 Python-only scan 不要求
+ESLint，但仍要求 Ruff 和 lizard。
+
 如果缺 detector，安装当前 strict mode 依赖：
 
 | Tool | What it is | Gate role |
 |---|---|---|
 | `ruff` | Fast Python linter | Python 魔法数字检测，使用 Ruff `PLR2004` 补强内置 AST fallback。 |
 | `lizard` | Cyclomatic complexity analyzer | 函数圈复杂度检测，用于 `IMP_007`。 |
-| `eslint` | JavaScript and TypeScript linter | JS/TS 魔法数字检测，使用 `no-magic-numbers`。 |
+| `eslint` | JavaScript and TypeScript linter | JS 魔法数字检测；TypeScript 还要求可工作的 parser/config。被 ESLint 忽略的 TS 文件会 fail closed。 |
 
 ```bash
 python3 -m pip install --upgrade ruff lizard
@@ -54,6 +58,9 @@ python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.p
 JSON report 的 `status` 可能是 `pass`、`fail`、`error` 或 `incomplete`。其中 `incomplete`
 表示没有扫描到支持的文件，不能当作质量绿灯。接入具体 IDE/CLI 前，先用 Generic CLI 跑通；
 再按 [hooks/README.md](./hooks/README.md) 或 [docs/ADAPTERS.md](./docs/ADAPTERS.md) 选择对应 adapter。
+每个 detector 的本次运行真相位于 `detectors.<name>.run`，包括 `status`、`coverage`、
+适用文件、fallback 和 `uncovered_files`。`not_applicable` 与缺工具不同；TypeScript
+ignored/parser/config diagnostic 是 `error`，不能解释为无问题。
 
 ## 实际目录结构（与磁盘一致）
 

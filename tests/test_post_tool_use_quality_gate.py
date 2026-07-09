@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,25 @@ RULES_DIR = ROOT / "rules"
 def make_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
+
+
+def lizard_script(files: list[Path], csv_output: str = "") -> str:
+    file_items = "".join(f'<item name="{path}" />' for path in files)
+    xml_output = (
+        '<cppncss><measure type="Function" />'
+        f'<measure type="File">{file_items}</measure></cppncss>'
+    )
+    csv_command = (
+        f"printf '%s\\n' {shlex.quote(csv_output)}\n" if csv_output else ":\n"
+    )
+    return (
+        "#!/bin/sh\n"
+        'if [ "$1" = "--xml" ]; then\n'
+        f"  printf '%s\\n' {shlex.quote(xml_output)}\n"
+        "else\n"
+        f"  {csv_command}"
+        "fi\n"
+    )
 
 
 def load_hook_module():
@@ -47,6 +67,34 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             command,
             input=json.dumps(payload),
             cwd=workspace,
+            env=full_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def run_files(
+        self,
+        workspace: Path,
+        files: list[Path],
+        *args: str,
+        env: dict[str, str] | None = None,
+        process_cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        full_env = os.environ.copy()
+        if env:
+            full_env.update(env)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(HOOK),
+                "--format",
+                "json",
+                *args,
+                "--files",
+                *[str(path) for path in files],
+            ],
+            cwd=process_cwd or workspace,
             env=full_env,
             capture_output=True,
             text=True,
@@ -731,44 +779,717 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertIn("Quality gate setup failed", result.stderr)
             self.assertIn("ruff", result.stderr)
 
-    def test_require_tools_checks_all_detectors_even_for_python_only_scan(self) -> None:
+    def test_require_tools_accepts_lizard_zero_function_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
             target = workspace / "clean.py"
-            target.write_text("MAX_RETRIES = 3\n", encoding="utf-8")
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
             make_executable(
                 bin_dir / "ruff",
                 "#!/bin/sh\nprintf '%s\\n' '[]'\n",
             )
             make_executable(
                 bin_dir / "lizard",
-                "#!/bin/sh\nprintf '%s\\n' 'NLOC,CCN,token,PARAM,length,location,file,function'\n",
+                lizard_script([target]),
             )
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(HOOK),
-                    "--format",
-                    "json",
-                    "--require-tools",
-                    "--files",
-                    str(target),
-                ],
-                cwd=workspace,
-                env={**os.environ, "PATH": str(bin_dir)},
-                capture_output=True,
-                text=True,
-                check=False,
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(report["tool_errors"], [])
+            self.assertEqual(report["detectors"]["lizard"]["run"]["status"], "succeeded")
+            self.assertEqual(report["detectors"]["lizard"]["run"]["coverage"], "complete")
+
+    def test_require_tools_ignores_irrelevant_eslint_for_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text("def identity(value):\n    return value\n", encoding="utf-8")
+            make_executable(bin_dir / "ruff", "#!/bin/sh\nprintf '%s\\n' '[]'\n")
+            make_executable(
+                bin_dir / "lizard",
+                "#!/bin/sh\n"
+                "printf '%s\\n' '2,1,8,1,2,1:1,clean.py,identity'\n",
+            )
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "pass")
+            self.assertFalse(report["detectors"]["eslint"]["available"])
+            self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "not_applicable")
+
+    def test_non_strict_lizard_failure_uses_visible_python_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "complex.py"
+            target.write_text(
+                "def route(flag):\n"
+                + "    if flag: flag = not flag\n" * 11
+                + "    return flag\n",
+                encoding="utf-8",
+            )
+            make_executable(bin_dir / "lizard", "#!/bin/sh\nprintf '%s\\n' 'malformed'\n")
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--complexity-threshold",
+                "10",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "fail")
+            self.assertIn("IMP_007", {issue["rule_id"] for issue in report["issues"]})
+            self.assertEqual(report["detectors"]["lizard"]["run"]["status"], "failed")
+            self.assertEqual(report["detectors"]["lizard"]["run"]["coverage"], "fallback")
+            self.assertEqual(report["detectors"]["lizard"]["run"]["fallback"], "python_ast")
+
+    def test_strict_lizard_failure_retains_error_and_fallback_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "complex.py"
+            target.write_text(
+                "def route(flag):\n"
+                + "    if flag: flag = not flag\n" * 11
+                + "    return flag\n",
+                encoding="utf-8",
+            )
+            make_executable(bin_dir / "ruff", "#!/bin/sh\nprintf '%s\\n' '[]'\n")
+            make_executable(bin_dir / "lizard", "#!/bin/sh\nprintf '%s\\n' 'malformed'\n")
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                "--complexity-threshold",
+                "10",
+                env={"PATH": str(bin_dir)},
             )
 
             self.assertEqual(result.returncode, 1, result.stdout)
             report = json.loads(result.stdout)
             self.assertEqual(report["status"], "error")
-            self.assertFalse(report["detectors"]["eslint"]["available"])
+            self.assertIn("lizard", {error["tool"] for error in report["tool_errors"]})
+            self.assertIn("IMP_007", {issue["rule_id"] for issue in report["issues"]})
+            self.assertEqual(report["detectors"]["lizard"]["run"]["coverage"], "fallback")
+
+    def test_eslint_ignored_typescript_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "typed.ts"
+            target.write_text(
+                "export function identity(value: string): string { return value; }\n",
+                encoding="utf-8",
+            )
+            eslint_payload = json.dumps(
+                [
+                    {
+                        "filePath": str(target),
+                        "messages": [
+                            {
+                                "ruleId": None,
+                                "severity": 1,
+                                "message": "File ignored because no matching configuration was supplied.",
+                            }
+                        ],
+                    }
+                ]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{eslint_payload}'\n",
+            )
+            make_executable(
+                bin_dir / "lizard",
+                "#!/bin/sh\n"
+                "printf '%s\\n' '1,1,8,1,1,1:1,typed.ts,identity'\n",
+            )
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
             self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
+            self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "ignored")
+            eslint_error = next(
+                error["message"] for error in report["tool_errors"] if error["tool"] == "eslint"
+            )
+            self.assertIn("ignored", eslint_error)
+
+    def test_eslint_reports_the_latest_variant_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "typed.ts"
+            target.write_text("export const label: string = 'ok';\n", encoding="utf-8")
+            ignored_payload = json.dumps(
+                [
+                    {
+                        "filePath": str(target),
+                        "messages": [
+                            {
+                                "ruleId": None,
+                                "message": "File ignored by the first variant.",
+                            }
+                        ],
+                    }
+                ]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                "#!/bin/sh\n"
+                'case " $* " in\n'
+                f"  *' --no-config-lookup '*) printf '%s\\n' '{ignored_payload}' ;;\n"
+                "  *) printf '%s\\n' 'second variant failed' >&2; exit 2 ;;\n"
+                "esac\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            eslint_run = report["detectors"]["eslint"]["run"]
+            self.assertEqual(eslint_run["status"], "failed")
+            self.assertIn("second variant failed", eslint_run["message"])
+
+    def test_eslint_runs_from_explicit_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            launch_dir = workspace / "launch"
+            bin_dir = workspace / "bin"
+            launch_dir.mkdir()
+            bin_dir.mkdir()
+            resolved_workspace = workspace.resolve()
+            target = workspace / "bad.js"
+            target.write_text("export function timeout() { return 5000; }\n", encoding="utf-8")
+            eslint_issue = json.dumps(
+                [
+                    {
+                        "filePath": "bad.js",
+                        "messages": [
+                            {
+                                "ruleId": "no-magic-numbers",
+                                "severity": 2,
+                                "line": 1,
+                                "message": "No magic number: 5000.",
+                            }
+                        ],
+                    }
+                ]
+            )
+            eslint_ignored = json.dumps(
+                [
+                    {
+                        "filePath": str(target),
+                        "messages": [
+                            {
+                                "ruleId": None,
+                                "severity": 1,
+                                "message": "File ignored because cwd did not match the project root.",
+                            }
+                        ],
+                    }
+                ]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                "#!/bin/sh\n"
+                f"if [ \"$PWD\" = \"{resolved_workspace}\" ]; then\n"
+                f"  printf '%s\\n' '{eslint_issue}'\n"
+                "else\n"
+                f"  printf '%s\\n' '{eslint_ignored}'\n"
+                "fi\n"
+                "exit 1\n",
+            )
+            make_executable(
+                bin_dir / "lizard",
+                "#!/bin/sh\n"
+                "printf '%s\\n' '1,1,8,1,1,1:1,bad.js,timeout'\n",
+            )
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--root",
+                str(resolved_workspace),
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+                process_cwd=launch_dir,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "fail")
+            self.assertEqual(report["tool_errors"], [])
+            self.assertIn("IMP_004", {issue["rule_id"] for issue in report["issues"]})
+            self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "succeeded")
+            eslint_issue_report = next(
+                issue for issue in report["issues"] if issue["rule_id"] == "IMP_004"
+            )
+            self.assertEqual(eslint_issue_report["file_path"], "bad.js")
+
+    def test_mixed_language_lizard_fallback_keeps_uncovered_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            python_target = workspace / "constants.py"
+            javascript_target = workspace / "complex.js"
+            python_target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            javascript_target.write_text(
+                "export function route(flag) {\n"
+                + "  if (flag) flag = !flag;\n" * 11
+                + "  return flag;\n}\n",
+                encoding="utf-8",
+            )
+            eslint_payload = json.dumps(
+                [{"filePath": str(javascript_target), "messages": []}]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{eslint_payload}'\n",
+            )
+            make_executable(bin_dir / "lizard", "#!/bin/sh\nprintf '%s\\n' 'malformed'\n")
+
+            result = self.run_files(
+                workspace,
+                [python_target, javascript_target],
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("lizard", {error["tool"] for error in report["tool_errors"]})
+            self.assertEqual(report["detectors"]["lizard"]["run"]["coverage"], "fallback")
+            self.assertEqual(
+                report["detectors"]["lizard"]["run"]["uncovered_files"],
+                ["complex.js"],
+            )
+
+    def test_eslint_missing_requested_file_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            javascript_target = workspace / "clean.js"
+            typescript_target = workspace / "typed.ts"
+            javascript_target.write_text("export const label = 'ok';\n", encoding="utf-8")
+            typescript_target.write_text("export const label: string = 'ok';\n", encoding="utf-8")
+            eslint_payload = json.dumps(
+                [{"filePath": str(javascript_target), "messages": []}]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{eslint_payload}'\n",
+            )
+            make_executable(
+                bin_dir / "lizard",
+                lizard_script([javascript_target, typescript_target]),
+            )
+
+            result = self.run_files(
+                workspace,
+                [javascript_target, typescript_target],
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("typed.ts", report["detectors"]["eslint"]["run"]["message"])
+
+    def test_malformed_ruff_location_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text("def identity(value):\n    return value\n", encoding="utf-8")
+            ruff_payload = json.dumps(
+                [
+                    {
+                        "code": "PLR2004",
+                        "filename": "clean.py",
+                        "location": "invalid",
+                        "message": "bad location",
+                    }
+                ]
+            )
+            make_executable(
+                bin_dir / "ruff",
+                f"#!/bin/sh\nprintf '%s\\n' '{ruff_payload}'\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("ruff", {error["tool"] for error in report["tool_errors"]})
+
+    def test_strict_ruff_nonzero_without_output_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            make_executable(bin_dir / "ruff", "#!/bin/sh\nexit 1\n")
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("ruff", {error["tool"] for error in report["tool_errors"]})
+
+    def test_strict_ruff_zero_without_json_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            make_executable(bin_dir / "ruff", "#!/bin/sh\nexit 0\n")
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("ruff", {error["tool"] for error in report["tool_errors"]})
+
+    def test_strict_ruff_exit_one_with_empty_json_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            make_executable(bin_dir / "ruff", "#!/bin/sh\nprintf '[]\\n'\nexit 1\n")
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("ruff", {error["tool"] for error in report["tool_errors"]})
+
+    def test_detector_exec_format_error_is_structured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            make_executable(bin_dir / "ruff", "not an executable format\n")
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("ruff", {error["tool"] for error in report["tool_errors"]})
+
+    def test_malformed_eslint_line_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "bad.js"
+            target.write_text("export function timeout() { return 5000; }\n", encoding="utf-8")
+            eslint_payload = json.dumps(
+                [
+                    {
+                        "filePath": str(target),
+                        "messages": [
+                            {
+                                "ruleId": "no-magic-numbers",
+                                "line": "invalid",
+                                "message": "bad line",
+                            }
+                        ],
+                    }
+                ]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{eslint_payload}'\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
+
+    def test_malformed_eslint_message_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.js"
+            target.write_text("export const label = 'ok';\n", encoding="utf-8")
+            eslint_payload = json.dumps(
+                [{"filePath": str(target), "messages": ["malformed"]}]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{eslint_payload}'\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
+
+    def test_eslint_exit_one_without_diagnostics_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.js"
+            target.write_text("export const LABEL = 'ok';\n", encoding="utf-8")
+            eslint_payload = json.dumps([{"filePath": str(target), "messages": []}])
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{eslint_payload}'\nexit 1\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
+
+    def test_eslint_embedded_null_file_path_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.js"
+            target.write_text("export const label = 'ok';\n", encoding="utf-8")
+            eslint_payload = json.dumps([{"filePath": "\0", "messages": []}])
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{eslint_payload}'\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
+
+    def test_malformed_lizard_ccn_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            make_executable(bin_dir / "ruff", "#!/bin/sh\nprintf '%s\\n' '[]'\n")
+            make_executable(
+                bin_dir / "lizard",
+                "#!/bin/sh\nprintf '%s\\n' '1,invalid,8,1,1,1:1,clean.py,dummy'\n",
+            )
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("lizard", {error["tool"] for error in report["tool_errors"]})
+
+    def test_lizard_unrequested_file_result_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "high.go"
+            target.write_text(
+                "package demo\nfunc route(flag bool) bool {\n"
+                + "  if flag { flag = !flag }\n" * 11
+                + "  return flag\n}\n",
+                encoding="utf-8",
+            )
+            make_executable(
+                bin_dir / "lizard",
+                lizard_script(
+                    [target],
+                    "1,1,8,1,1,1:1,other.go,other",
+                ),
+            )
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("lizard", {error["tool"] for error in report["tool_errors"]})
+
+    def test_unreadable_python_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "unreadable.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            target.chmod(0)
+            try:
+                result = self.run_files(
+                    workspace,
+                    [target],
+                    env={"PATH": "/nonexistent"},
+                )
+            finally:
+                target.chmod(0o600)
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("python-ast", {error["tool"] for error in report["tool_errors"]})
+
+    def test_non_utf8_javascript_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "invalid.js"
+            target.write_bytes(b"export const value = '\xff';\n")
+
+            result = self.run_files(
+                workspace,
+                [target],
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("source-read", {error["tool"] for error in report["tool_errors"]})
+
+    def test_python_syntax_error_is_structured_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "invalid.py"
+            target.write_text("def broken(:\n    pass\n", encoding="utf-8")
+
+            result = self.run_files(
+                workspace,
+                [target],
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertIn("python-ast", {error["tool"] for error in report["tool_errors"]})
 
     def test_require_tools_fails_closed_on_malformed_lizard_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1128,7 +1849,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             )
             make_executable(
                 bin_dir / "lizard",
-                "#!/bin/sh\nprintf '%s\\n' 'NLOC,CCN,token,PARAM,length,location,file,function'\n",
+                lizard_script([target]),
             )
             payload = {
                 "hook_event_name": "PostToolUse",

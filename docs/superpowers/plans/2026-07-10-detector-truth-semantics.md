@@ -25,10 +25,10 @@
 1. A detector outcome is one of `succeeded`, `not_applicable`, `missing`, `failed`, or `ignored`.
 2. Coverage is one of `complete`, `fallback`, or `none`.
 3. `--require-tools` applies only to detectors relevant to the scanned file types. `--doctor --require-tools` remains the full-install readiness check.
-4. A successful detector with zero findings is valid, including lizard exit 0 with empty output.
+4. A successful detector with zero findings is valid. An empty lizard CSV is valid only when a follow-up XML File measure proves every requested file was processed.
 5. A failed or missing lizard may use the Python AST fallback. Strict mode still returns `error`; non-strict mode may use the fallback result, but the fallback is visible in the report.
 6. ESLint ignored, parser, fatal, or configuration diagnostics are coverage failures. TypeScript must never pass when ESLint did not actually lint it.
-7. Python source that the runtime AST cannot parse produces a structured tool error instead of silently returning zero findings.
+7. Source that cannot be read as UTF-8 produces a structured tool error. Python source that the runtime AST cannot parse also fails instead of silently returning zero findings.
 8. Existing report schema and top-level statuses remain compatible; detector run truth is added under each `detectors.<name>.run` object.
 
 ### Task 1: Lock the Runtime Failure Contract with Tests
@@ -36,31 +36,31 @@
 **Files:**
 - Modify: `tests/test_post_tool_use_quality_gate.py`
 
-- [ ] **Step 1: Add a strict zero-function lizard regression test**
+- [x] **Step 1: Add a strict zero-function lizard regression test**
 
-Add a test using fake `ruff`, `eslint`, and `lizard` executables. Ruff returns `[]`, lizard exits 0 with empty stdout, and the target is `APP_NAME = "demo"`. Assert exit 0, `status == "pass"`, no tool errors, and lizard run status `succeeded` with `coverage == "complete"`.
+Add a test using fake `ruff`, `eslint`, and `lizard` executables. Ruff returns `[]`; lizard returns an empty CSV plus an XML File measure for the target `APP_NAME = "demo"`. Assert exit 0, `status == "pass"`, no tool errors, and lizard run status `succeeded` with `coverage == "complete"`.
 
-- [ ] **Step 2: Add a non-strict malformed-lizard fallback test**
+- [x] **Step 2: Add a non-strict malformed-lizard fallback test**
 
 Use a Python function with eleven independent branches and a fake lizard that prints malformed CSV. Assert the report contains `IMP_007`, the lizard run status is `failed`, coverage is `fallback`, fallback is `python_ast`, and no false `pass` is possible.
 
-- [ ] **Step 3: Add the corresponding strict malformed-lizard test**
+- [x] **Step 3: Add the corresponding strict malformed-lizard test**
 
 Run the same fixture with `--require-tools`. Assert `status == "error"`, the lizard tool error remains visible, and the fallback `IMP_007` issue is still retained for remediation.
 
-- [ ] **Step 4: Add a TypeScript ignored-file test**
+- [x] **Step 4: Add a TypeScript ignored-file test**
 
 Make fake ESLint return a JSON message with `ruleId: null` and `message: "File ignored because no matching configuration was supplied."`. Assert `status == "error"`, ESLint run status `ignored`, and the ignored diagnostic is present in `tool_errors`.
 
-- [ ] **Step 5: Replace the Python-only strict dependency expectation**
+- [x] **Step 5: Replace the Python-only strict dependency expectation**
 
 Replace `test_require_tools_checks_all_detectors_even_for_python_only_scan` with a test that omits ESLint, supplies working Ruff and lizard, and asserts ESLint is `not_applicable` while the Python scan succeeds.
 
-- [ ] **Step 6: Add a Python syntax preflight test**
+- [x] **Step 6: Add a Python syntax preflight test**
 
 Scan syntactically invalid Python and assert a structured `python-ast` tool error and `status == "error"`; the process must not return `pass` or traceback.
 
-- [ ] **Step 7: Run the focused tests and confirm RED**
+- [x] **Step 7: Run the focused tests and confirm RED**
 
 Run:
 
@@ -81,7 +81,7 @@ Expected: failures caused by absent detector outcomes and current false pass/fal
 **Files:**
 - Modify: `hooks/post_tool_use_quality_gate.py`
 
-- [ ] **Step 1: Add `DetectorOutcome`**
+- [x] **Step 1: Add `DetectorOutcome`**
 
 Define an immutable dataclass with these fields:
 
@@ -93,24 +93,25 @@ class DetectorOutcome:
     files: tuple[str, ...]
     fallback: str | None = None
     message: str | None = None
+    uncovered_files: tuple[str, ...] = ()
 
     def to_schema(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 ```
 
-- [ ] **Step 2: Return outcomes from each external runner**
+- [x] **Step 2: Return outcomes from each external runner**
 
 Change `run_ruff`, `run_eslint`, and `run_lizard` to return `(issues, errors, outcome)` instead of the availability boolean. Use `not_applicable` when the runner has no relevant files, `missing` when no executable exists, `failed` for timeout/nonzero/malformed output, `ignored` for ESLint coverage diagnostics, and `succeeded` for a parsed result including zero findings.
 
-- [ ] **Step 3: Treat lizard exit 0 with empty output as success**
+- [x] **Step 3: Prove zero-function lizard coverage**
 
-When `returncode == 0` and stdout is empty, return no issues, no errors, and `DetectorOutcome(status="succeeded", coverage="complete", ...)`. Keep malformed non-empty output as `failed`.
+When CSV has no function row for a requested file, run lizard XML for that file and require a matching File measure before returning `DetectorOutcome(status="succeeded", coverage="complete", ...)`. Empty or malformed XML and unrequested CSV file rows are failures.
 
-- [ ] **Step 4: Reject ESLint meta diagnostics**
+- [x] **Step 4: Reject ESLint meta diagnostics**
 
 Add a helper that extracts any ESLint message that is fatal or has no `ruleId`. An ignored-file message maps to outcome status `ignored`; parser/configuration diagnostics map to `failed`. Do not silently discard these messages in `parse_eslint_payload`.
 
-- [ ] **Step 5: Run focused parser tests**
+- [x] **Step 5: Run focused parser tests**
 
 Run the tests added in Task 1 that target lizard and ESLint. Expected: detector runner tests move toward GREEN; orchestration/report assertions may remain RED.
 
@@ -120,29 +121,29 @@ Run the tests added in Task 1 that target lizard and ESLint. Expected: detector 
 - Modify: `hooks/post_tool_use_quality_gate.py`
 - Modify: `tests/test_post_tool_use_quality_gate.py`
 
-- [ ] **Step 1: Add Python AST preflight**
+- [x] **Step 1: Add Python AST preflight**
 
 Before Python AST-based rules execute, parse every Python file once for validation. Convert `SyntaxError`, `UnicodeDecodeError`, and read failures into a `ToolError("python-ast", ...)` so invalid or unreadable Python cannot pass silently.
 
-- [ ] **Step 2: Apply fallback rules in `scan_files`**
+- [x] **Step 2: Apply fallback rules in `scan_files`**
 
 If lizard is `missing` or `failed`, run Python AST complexity for Python files. Set lizard coverage to `fallback` and fallback to `python_ast`. If non-Python files also depended on lizard, preserve the lizard error because coverage remains incomplete.
 
 The built-in literal scanner remains the non-strict fallback for Ruff and JavaScript ESLint. TypeScript ignored/failed coverage remains an error because the regex scanner is not an equivalent TypeScript parser.
 
-- [ ] **Step 3: Scope strict errors to applicable detectors**
+- [x] **Step 3: Scope strict errors to applicable detectors**
 
-Remove the unconditional scan-time `required_detector_errors(detectors)` call from `main`. Detector runners now emit missing-tool errors only for applicable files. Keep `required_detector_errors` for doctor readiness.
+Remove the unconditional scan-time full-inventory detector check from `main`. Detector runners now emit missing-tool errors only for applicable files. Doctor readiness continues to check the complete inventory in `build_doctor_report`.
 
-- [ ] **Step 4: Merge run outcomes into the JSON report**
+- [x] **Step 4: Merge run outcomes into the JSON report**
 
 Keep `available/path/version` and add a `run` object to each detector. `not_applicable` must be explicit. Ensure the report can explain a fallback even when top-level status is `fail` because the fallback found an issue.
 
-- [ ] **Step 5: Run the focused suite and confirm GREEN**
+- [x] **Step 5: Run the focused suite and confirm GREEN**
 
 Run the six focused tests from Task 1. Expected: all pass.
 
-- [ ] **Step 6: Run the complete unit suite**
+- [x] **Step 6: Run the complete unit suite**
 
 Run:
 
@@ -159,19 +160,19 @@ Expected: all tests pass with the new regression cases included.
 - Modify: `docs/ADAPTERS.md`
 - Modify: `hooks/README.md`
 
-- [ ] **Step 1: Document profile-scoped strict semantics**
+- [x] **Step 1: Document profile-scoped strict semantics**
 
 State that `--require-tools` requires only detectors applicable to the scanned files, while doctor strict mode checks the complete installation inventory.
 
-- [ ] **Step 2: Document detector run outcomes**
+- [x] **Step 2: Document detector run outcomes**
 
 Add `detectors.<name>.run.status/coverage/fallback` to the report contract. State that TypeScript ignored/parser diagnostics are errors until a verified parser/config is present.
 
-- [ ] **Step 3: Replay installed tools**
+- [x] **Step 3: Replay installed tools**
 
 Run a strict clean Python constant-only scan, strict bad Python scan, strict JavaScript scan, and strict TypeScript scan with the installed Ruff, ESLint, and lizard. Expected: clean Python passes; bad Python/JavaScript fail with issues; TypeScript either executes verified linting or returns error, never pass when ignored.
 
-- [ ] **Step 4: Run all repository gates**
+- [x] **Step 4: Run all repository gates**
 
 Run:
 
@@ -185,11 +186,11 @@ git diff --check
 
 Expected: all commands exit 0. The full repository quality scan may still report known baseline debt; it must have zero tool errors and no false pass.
 
-- [ ] **Step 5: Obtain non-author review**
+- [x] **Step 5: Obtain non-author review**
 
 Give the final diff and replay commands to a fresh reviewer. Blocking findings must be resolved before commit.
 
-- [ ] **Step 6: Commit the verified slice**
+- [x] **Step 6: Commit the verified slice**
 
 Stage only the plan, hook, tests, and aligned docs. Commit with an accurate message such as:
 
@@ -204,4 +205,3 @@ git commit -m "Make detector coverage failures explicit"
 - Python runtime minimum and profile-aware `doctor --probe`.
 - Installable `vcg` CLI, pinned detector toolchain, init/uninstall flow.
 - Real Claude Code and Codex runtime certification.
-

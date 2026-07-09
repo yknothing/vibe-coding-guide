@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +118,7 @@ RATCHET_METRICS = {
 
 PYTHON_EXTENSIONS = {".py"}
 JS_TS_EXTENSIONS = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+TYPESCRIPT_EXTENSIONS = {".ts", ".tsx"}
 SCANNED_EXTENSIONS = PYTHON_EXTENSIONS | JS_TS_EXTENSIONS | {
     ".go",
     ".java",
@@ -214,6 +216,19 @@ class DoctorCheck:
     message: str
     detail: dict[str, Any] | None = None
     remediation: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class DetectorOutcome:
+    status: str
+    coverage: str
+    files: tuple[str, ...]
+    fallback: str | None = None
+    message: str | None = None
+    uncovered_files: tuple[str, ...] = ()
+
+    def to_schema(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -339,7 +354,9 @@ def collect_path_values(value: Any, key_hint: str = "") -> list[str]:
     return paths
 
 
-def run_detector(command: list[str]) -> tuple[subprocess.CompletedProcess[str] | None, ToolError | None]:
+def run_detector(
+    command: list[str], cwd: Path | None = None
+) -> tuple[subprocess.CompletedProcess[str] | None, ToolError | None]:
     tool = Path(command[0]).name
     try:
         return (
@@ -349,11 +366,14 @@ def run_detector(command: list[str]) -> tuple[subprocess.CompletedProcess[str] |
                 text=True,
                 check=False,
                 timeout=TOOL_TIMEOUT_SECONDS,
+                cwd=cwd,
             ),
             None,
         )
     except subprocess.TimeoutExpired:
         return None, ToolError(tool, f"{tool} timed out after {TOOL_TIMEOUT_SECONDS}s.")
+    except (OSError, UnicodeError, ValueError) as exc:
+        return None, ToolError(tool, f"{tool} could not run: {exc}")
 
 
 def command_version(command: str) -> str | None:
@@ -391,20 +411,6 @@ def detector_inventory(include_install: bool = False) -> dict[str, dict[str, Any
             info["install"] = detector_install_info(detector)
         inventory[detector] = info
     return inventory
-
-
-def required_detector_errors(detectors: dict[str, dict[str, Any]]) -> list[ToolError]:
-    errors: list[ToolError] = []
-    for detector in REQUIRED_DETECTORS:
-        info = detectors.get(detector, {})
-        if not info.get("available"):
-            errors.append(
-                ToolError(
-                    detector,
-                    f"{detector} is required in strict --require-tools mode. {detector_remediation(detector)}",
-                )
-            )
-    return errors
 
 
 def detector_remediation(detector: str) -> str:
@@ -712,6 +718,16 @@ def relative_path(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
+def resolve_detector_path(raw_path: str, root: Path) -> Path | None:
+    try:
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = root / path
+        return path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def has_allow_magic(lines: list[str], line_index: int) -> bool:
     start = max(0, line_index - 2)
     return any(ALLOW_TOKEN in lines[idx] for idx in range(start, line_index + 1))
@@ -772,7 +788,7 @@ def scan_magic_values_builtin(path: Path, root: Path) -> list[Issue]:
     rel = relative_path(path, root)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except UnicodeDecodeError:
+    except (OSError, UnicodeDecodeError):
         return []
 
     issues: list[Issue] = []
@@ -898,7 +914,7 @@ def python_cyclomatic_complexity(node: ast.AST) -> int:
 def scan_python_complexity_builtin(path: Path, root: Path, threshold: int) -> list[Issue]:
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError):
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return []
     visitor = PythonComplexityVisitor(relative_path(path, root), threshold)
     visitor.visit(tree)
@@ -925,7 +941,7 @@ def scan_python_public_api_docstrings(path: Path, root: Path) -> list[Issue]:
         return []
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError):
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return []
     exports = exported_names(tree)
     if not exports:
@@ -1002,7 +1018,7 @@ def scan_python_pass_through_functions(path: Path, root: Path) -> list[Issue]:
         return []
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError):
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return []
 
     issues: list[Issue] = []
@@ -1042,7 +1058,7 @@ def python_complexity_metrics(path: Path) -> dict[str, int]:
         return metrics
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError):
+    except (OSError, SyntaxError, UnicodeDecodeError):
         return metrics
 
     complexities = [
@@ -1167,13 +1183,90 @@ def evaluate_ratchet(
     }, []
 
 
-def run_ruff(files: list[Path], root: Path, require_tools: bool) -> tuple[list[Issue], list[ToolError], bool]:
+def parse_ruff_diagnostics(
+    diagnostics: list[Any], root: Path
+) -> tuple[list[Issue], str | None]:
+    issues: list[Issue] = []
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            return [], "Ruff JSON diagnostics must be objects."
+        if diagnostic.get("code") != "PLR2004":
+            continue
+        raw_filename = diagnostic.get("filename")
+        location = diagnostic.get("location")
+        if not isinstance(raw_filename, str) or not raw_filename:
+            return [], "Ruff PLR2004 diagnostics must include a filename."
+        if not isinstance(location, dict):
+            return [], "Ruff PLR2004 diagnostics must include an object location."
+        try:
+            row = int(location.get("row"))
+        except (TypeError, ValueError):
+            return [], "Ruff PLR2004 diagnostics must include a numeric location row."
+        filename = resolve_detector_path(raw_filename, root)
+        if filename is None:
+            return [], "Ruff PLR2004 diagnostic filename could not be resolved."
+        issues.append(
+            Issue(
+                rule_id="IMP_004",
+                severity="M",
+                category="IMP",
+                file_path=relative_path(filename, root),
+                start_line=row,
+                end_line=row,
+                message=diagnostic.get("message")
+                or "Magic numeric literal detected by Ruff PLR2004.",
+                detailed_explanation=(
+                    "Ruff PLR2004 detected an unnamed comparison literal; "
+                    "replace it with a named constant or a configuration value."
+                ),
+                suggested_action="FIX",
+                code_snippet=None,
+                metric_values={"detector": "ruff", "code": "PLR2004"},
+            )
+        )
+    return issues, None
+
+
+def ruff_exit_consistency_error(diagnostics: list[Any], returncode: int) -> str | None:
+    if returncode == 1 and not diagnostics:
+        return "Ruff exited 1 but produced no diagnostics."
+    if returncode == 0 and diagnostics:
+        return "Ruff exited 0 but produced diagnostics."
+    return None
+
+
+def parse_ruff_result(
+    result: subprocess.CompletedProcess[str], root: Path
+) -> tuple[list[Issue], str | None]:
+    if result.returncode not in {0, 1}:
+        return [], result.stderr.strip() or "Ruff failed."
+    if not result.stdout.strip():
+        return [], result.stderr.strip() or "Ruff failed without JSON output."
+    try:
+        diagnostics = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return [], "Ruff produced non-JSON output."
+    if not isinstance(diagnostics, list):
+        return [], "Ruff JSON output must be an array."
+    consistency_error = ruff_exit_consistency_error(diagnostics, result.returncode)
+    if consistency_error:
+        return [], consistency_error
+    return parse_ruff_diagnostics(diagnostics, root)
+
+
+def run_ruff(
+    files: list[Path], root: Path, _require_tools: bool
+) -> tuple[list[Issue], list[ToolError], DetectorOutcome]:
     python_files = [path for path in files if path.suffix in PYTHON_EXTENSIONS]
+    outcome_files = tuple(relative_path(path, root) for path in python_files)
     if not python_files:
-        return [], [], True
+        return [], [], DetectorOutcome("not_applicable", "none", ())
     ruff = shutil.which("ruff")
     if not ruff:
-        return [], [ToolError("ruff", "Ruff is required for Python PLR2004 magic-value checks.")], False
+        message = "Ruff is required for Python PLR2004 magic-value checks."
+        return [], [ToolError("ruff", message)], DetectorOutcome(
+            "missing", "none", outcome_files, message=message
+        )
 
     result, timeout_error = run_detector(
         [
@@ -1186,62 +1279,140 @@ def run_ruff(files: list[Path], root: Path, require_tools: bool) -> tuple[list[I
             "--no-cache",
             "--",
             *[str(path) for path in python_files],
-        ]
+        ],
+        cwd=root,
     )
     if timeout_error:
-        return [], [timeout_error], True
-    assert result is not None
-    if require_tools and result.returncode not in {0, 1}:
-        return [], [ToolError("ruff", result.stderr.strip() or "Ruff failed.")], True
-    if not result.stdout.strip():
-        if result.returncode not in {0, 1}:
-            return [], [ToolError("ruff", result.stderr.strip() or "Ruff failed without JSON output.")], True
-        return [], [], True
-
-    try:
-        diagnostics = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return [], [ToolError("ruff", "Ruff produced non-JSON output.")], True
-    if not isinstance(diagnostics, list):
-        return [], [ToolError("ruff", "Ruff JSON output must be an array.")], True
-
-    issues: list[Issue] = []
-    for diagnostic in diagnostics:
-        if not isinstance(diagnostic, dict):
-            return [], [ToolError("ruff", "Ruff JSON diagnostics must be objects.")], True
-        if diagnostic.get("code") != "PLR2004":
-            continue
-        filename = Path(str(diagnostic.get("filename", ""))).resolve()
-        location = diagnostic.get("location") or {}
-        row = int(location.get("row") or 1)
-        issues.append(
-            Issue(
-                rule_id="IMP_004",
-                severity="M",
-                category="IMP",
-                file_path=relative_path(filename, root),
-                start_line=row,
-                end_line=row,
-                message=diagnostic.get("message") or "Magic numeric literal detected by Ruff PLR2004.",
-                detailed_explanation=(
-                    "Ruff PLR2004 detected an unnamed comparison literal; "
-                    "replace it with a named constant or a configuration value."
-                ),
-                suggested_action="FIX",
-                code_snippet=None,
-                metric_values={"detector": "ruff", "code": "PLR2004"},
-            )
+        return [], [timeout_error], DetectorOutcome(
+            "failed", "none", outcome_files, message=timeout_error.message
         )
-    return issues, [], True
+    assert result is not None
+    issues, parse_error = parse_ruff_result(result, root)
+    if parse_error:
+        return [], [ToolError("ruff", parse_error)], DetectorOutcome(
+            "failed", "none", outcome_files, message=parse_error
+        )
+    return issues, [], DetectorOutcome("succeeded", "complete", outcome_files)
 
 
-def run_eslint(files: list[Path], root: Path, require_tools: bool) -> tuple[list[Issue], list[ToolError], bool]:
+def iter_eslint_messages(payload: list[Any]):
+    for file_result in payload:
+        if not isinstance(file_result, dict):
+            continue
+        messages = file_result.get("messages", [])
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if isinstance(message, dict):
+                yield message
+
+
+def eslint_payload_errors(payload: list[Any], root: Path) -> list[str]:
+    errors: list[str] = []
+    for result in payload:
+        if not isinstance(result, dict):
+            errors.append("ESLint JSON file results must be objects.")
+            continue
+        raw_file_path = result.get("filePath")
+        if not isinstance(raw_file_path, str) or not raw_file_path:
+            errors.append("ESLint JSON file results must include a filePath.")
+        elif resolve_detector_path(raw_file_path, root) is None:
+            errors.append("ESLint JSON file result filePath could not be resolved.")
+        messages = result.get("messages", [])
+        if not isinstance(messages, list):
+            errors.append("ESLint JSON file result messages must be an array.")
+        elif any(not isinstance(message, dict) for message in messages):
+            errors.append("ESLint JSON messages must be objects.")
+    return errors
+
+
+def eslint_reported_files(payload: list[Any], root: Path) -> set[Path]:
+    reported: set[Path] = set()
+    for result in payload:
+        if not isinstance(result, dict):
+            continue
+        raw_file_path = result.get("filePath")
+        if not isinstance(raw_file_path, str) or not raw_file_path:
+            continue
+        file_path = resolve_detector_path(raw_file_path, root)
+        if file_path is not None:
+            reported.add(file_path)
+    return reported
+
+
+def eslint_missing_files(
+    payload: list[Any], expected_files: list[Path], root: Path
+) -> list[str]:
+    reported_files = eslint_reported_files(payload, root)
+    return [
+        relative_path(path, root)
+        for path in expected_files
+        if path.resolve() not in reported_files
+    ]
+
+
+def eslint_magic_line_error(payload: list[Any]) -> str | None:
+    for message in iter_eslint_messages(payload):
+        if message.get("ruleId") != "no-magic-numbers":
+            continue
+        if not isinstance(message.get("line") or 1, int):
+            return "ESLint no-magic-numbers diagnostics must include a numeric line."
+    return None
+
+
+def eslint_exit_consistency_error(payload: list[Any], returncode: int) -> str | None:
+    has_messages = any(True for _ in iter_eslint_messages(payload))
+    if returncode == 1 and not has_messages:
+        return "ESLint exited 1 but produced no diagnostics."
+    if returncode == 0 and has_messages:
+        return "ESLint exited 0 but produced diagnostics."
+    return None
+
+
+def eslint_coverage_diagnostic(
+    payload: list[Any], expected_files: list[Path], root: Path
+) -> tuple[str | None, str | None]:
+    messages = eslint_payload_errors(payload, root)
+    missing_files = eslint_missing_files(payload, expected_files, root)
+    if missing_files:
+        messages.append(f"ESLint omitted requested file(s): {', '.join(missing_files)}.")
+
+    diagnostics = [
+        message
+        for message in iter_eslint_messages(payload)
+        if message.get("ruleId") is None or message.get("fatal")
+    ]
+    diagnostic_messages = [
+        str(message.get("message") or "ESLint emitted an unclassified diagnostic.")
+        for message in diagnostics
+    ]
+    messages.extend(diagnostic_messages)
+    line_error = eslint_magic_line_error(payload)
+    if line_error:
+        messages.append(line_error)
+    if not messages:
+        return None, None
+    status = (
+        "ignored"
+        if any("ignored" in message.lower() for message in diagnostic_messages)
+        else "failed"
+    )
+    return status, "; ".join(messages)
+
+
+def run_eslint(
+    files: list[Path], root: Path, _require_tools: bool
+) -> tuple[list[Issue], list[ToolError], DetectorOutcome]:
     js_files = [path for path in files if path.suffix in JS_TS_EXTENSIONS]
+    outcome_files = tuple(relative_path(path, root) for path in js_files)
     if not js_files:
-        return [], [], True
+        return [], [], DetectorOutcome("not_applicable", "none", ())
     eslint = shutil.which("eslint")
     if not eslint:
-        return [], [ToolError("eslint", "ESLint is required for JS/TS no-magic-numbers checks.")], False
+        message = "ESLint is required for JS/TS no-magic-numbers checks."
+        return [], [ToolError("eslint", message)], DetectorOutcome(
+            "missing", "none", outcome_files, message=message
+        )
 
     rule_config = json.dumps(
         {
@@ -1262,27 +1433,77 @@ def run_eslint(files: list[Path], root: Path, require_tools: bool) -> tuple[list
     ]
 
     last_error = ""
+    failure_status = "failed"
     for command in command_variants:
-        result, timeout_error = run_detector(command)
+        result, timeout_error = run_detector(command, cwd=root)
         if timeout_error:
+            failure_status = "failed"
             last_error = timeout_error.message
             continue
         assert result is not None
-        if require_tools and result.returncode not in {0, 1}:
+        if result.returncode not in {0, 1}:
+            failure_status = "failed"
             last_error = result.stderr.strip() or "ESLint failed."
             continue
         if result.stdout.strip():
             try:
                 payload = json.loads(result.stdout)
             except json.JSONDecodeError:
+                failure_status = "failed"
                 last_error = "ESLint produced non-JSON output."
                 continue
             if not isinstance(payload, list):
+                failure_status = "failed"
                 last_error = "ESLint JSON output must be an array."
                 continue
-            return parse_eslint_payload(payload, root), [], True
+            diagnostic_status, diagnostic_message = eslint_coverage_diagnostic(
+                payload, js_files, root
+            )
+            if diagnostic_status is not None:
+                failure_status = diagnostic_status
+                last_error = diagnostic_message or "ESLint did not lint every requested file."
+                continue
+            consistency_error = eslint_exit_consistency_error(payload, result.returncode)
+            if consistency_error:
+                failure_status = "failed"
+                last_error = consistency_error
+                continue
+            return (
+                parse_eslint_payload(payload, root),
+                [],
+                DetectorOutcome("succeeded", "complete", outcome_files),
+            )
+        failure_status = "failed"
         last_error = result.stderr.strip()
-    return [], [ToolError("eslint", last_error or "ESLint failed without JSON output.")], True
+    message = last_error or "ESLint failed without JSON output."
+    return [], [ToolError("eslint", message)], DetectorOutcome(
+        failure_status, "none", outcome_files, message=message
+    )
+
+
+def eslint_issue_from_message(
+    message: dict[str, Any], filename: Path, root: Path
+) -> Issue | None:
+    if message.get("ruleId") != "no-magic-numbers":
+        return None
+    line = message.get("line") or 1
+    if not isinstance(line, int):
+        return None
+    return Issue(
+        rule_id="IMP_004",
+        severity="M",
+        category="IMP",
+        file_path=relative_path(filename, root),
+        start_line=line,
+        end_line=line,
+        message=message.get("message") or "Magic numeric literal detected by ESLint.",
+        detailed_explanation=(
+            "ESLint no-magic-numbers detected an unnamed numeric literal; "
+            "replace it with a named constant or a configuration value."
+        ),
+        suggested_action="FIX",
+        metric_values={"detector": "eslint", "rule": "no-magic-numbers"},
+    )
 
 
 def parse_eslint_payload(payload: Any, root: Path) -> list[Issue]:
@@ -1292,71 +1513,57 @@ def parse_eslint_payload(payload: Any, root: Path) -> list[Issue]:
     for file_result in payload:
         if not isinstance(file_result, dict):
             continue
-        filename = Path(str(file_result.get("filePath", ""))).resolve()
+        raw_filename = file_result.get("filePath")
+        if not isinstance(raw_filename, str) or not raw_filename:
+            continue
+        filename = resolve_detector_path(raw_filename, root)
+        if filename is None:
+            continue
         for message in file_result.get("messages", []):
             if not isinstance(message, dict):
                 continue
-            if message.get("ruleId") != "no-magic-numbers":
-                continue
-            row = int(message.get("line") or 1)
-            issues.append(
-                Issue(
-                    rule_id="IMP_004",
-                    severity="M",
-                    category="IMP",
-                    file_path=relative_path(filename, root),
-                    start_line=row,
-                    end_line=row,
-                    message=message.get("message") or "Magic numeric literal detected by ESLint.",
-                    detailed_explanation=(
-                        "ESLint no-magic-numbers detected an unnamed numeric literal; "
-                        "replace it with a named constant or a configuration value."
-                    ),
-                    suggested_action="FIX",
-                    metric_values={"detector": "eslint", "rule": "no-magic-numbers"},
-                )
-            )
+            issue = eslint_issue_from_message(message, filename, root)
+            if issue:
+                issues.append(issue)
     return issues
 
 
-def run_lizard(
-    files: list[Path], root: Path, threshold: int, require_tools: bool
-) -> tuple[list[Issue], list[ToolError], bool]:
-    if not files:
-        return [], [], True
-    lizard = shutil.which("lizard")
-    if not lizard:
-        return [], [ToolError("lizard", "lizard is required for function complexity checks.")], False
+def lizard_row_values(
+    row: dict[str, str], expected_files: set[Path], root: Path
+) -> tuple[int, Path, int, str | None]:
+    try:
+        ccn = int(float(row.get("CCN", "0")))
+    except (TypeError, ValueError):
+        return 0, root, 0, "lizard CSV output contains a non-numeric CCN value."
+    raw_file_path = row.get("file")
+    if not raw_file_path:
+        return 0, root, 0, "lizard CSV output contains an empty file path."
+    file_path = resolve_detector_path(raw_file_path, root)
+    if file_path is None:
+        return 0, root, 0, "lizard CSV file path could not be resolved."
+    if file_path not in expected_files:
+        rel = relative_path(file_path, root)
+        return 0, root, 0, f"lizard reported an unrequested file: {rel}."
+    location = row.get("start_line") or row.get("location") or "1"
+    try:
+        line = int(location.split(":", 1)[0])
+    except ValueError:
+        return 0, root, 0, "lizard CSV output contains a non-numeric start line."
+    return ccn, file_path, line, None
 
-    result, timeout_error = run_detector([lizard, "--csv", *[str(path) for path in files]])
-    if timeout_error:
-        return [], [timeout_error], True
-    assert result is not None
-    if require_tools and result.returncode not in {0, 1}:
-        return [], [ToolError("lizard", result.stderr.strip() or "lizard failed.")], True
-    if result.returncode not in {0, 1} and not result.stdout.strip():
-        return [], [ToolError("lizard", result.stderr.strip() or "lizard failed without CSV output.")], True
-    if require_tools and not result.stdout.strip():
-        return [], [ToolError("lizard", "lizard produced empty CSV output.")], True
 
+def parse_lizard_rows(
+    rows: list[dict[str, str]], expected_files: set[Path], root: Path, threshold: int
+) -> tuple[list[Issue], set[Path], str | None]:
     issues: list[Issue] = []
-    rows = parse_lizard_csv(result.stdout)
-    if not rows:
-        return [], [ToolError("lizard", "lizard CSV output is missing required fields.")], True
+    covered_files: set[Path] = set()
     for row in rows:
-        try:
-            ccn = int(float(row.get("CCN", "0")))
-        except ValueError:
-            continue
+        ccn, file_path, line, row_error = lizard_row_values(row, expected_files, root)
+        if row_error:
+            return [], set(), row_error
+        covered_files.add(file_path)
         if ccn <= threshold:
             continue
-        file_path = Path(row.get("file") or "").resolve()
-        location = row.get("start_line") or row.get("location") or "1"
-        line_text = location.split(":", 1)[0]
-        try:
-            line = int(line_text)
-        except ValueError:
-            line = 1
         function = row.get("function") or "<unknown>"
         issues.append(
             Issue(
@@ -1379,19 +1586,141 @@ def run_lizard(
                 },
             )
         )
-    return issues, [], True
+    return issues, covered_files, None
 
 
-def parse_lizard_csv(output: str) -> list[dict[str, str]]:
+def parse_lizard_xml_files(output: str, root: Path) -> tuple[set[Path], str | None]:
+    try:
+        xml_root = ET.fromstring(output)
+    except ET.ParseError:
+        return set(), "lizard XML coverage probe produced malformed XML."
+    file_measure = next(
+        (measure for measure in xml_root.findall("measure") if measure.get("type") == "File"),
+        None,
+    )
+    if file_measure is None:
+        return set(), "lizard XML coverage probe omitted the File measure."
+
+    reported_files: set[Path] = set()
+    for item in file_measure.findall("item"):
+        raw_file_path = item.get("name")
+        if not raw_file_path:
+            return set(), "lizard XML coverage probe contains an empty file path."
+        file_path = resolve_detector_path(raw_file_path, root)
+        if file_path is None:
+            return set(), "lizard XML coverage file path could not be resolved."
+        reported_files.add(file_path)
+    return reported_files, None
+
+
+def lizard_coverage_difference_error(
+    reported_files: set[Path], files: list[Path], root: Path
+) -> str | None:
+    expected_files = {path.resolve() for path in files}
+    missing = expected_files - reported_files
+    unexpected = reported_files - expected_files
+    if missing:
+        names = ", ".join(sorted(relative_path(path, root) for path in missing))
+        return f"lizard XML coverage omitted requested file(s): {names}."
+    if unexpected:
+        names = ", ".join(sorted(relative_path(path, root) for path in unexpected))
+        return f"lizard XML coverage reported unrequested file(s): {names}."
+    return None
+
+
+def lizard_xml_coverage_error(
+    lizard: str, files: list[Path], root: Path
+) -> str | None:
+    result, run_error = run_detector(
+        [lizard, "--xml", *[str(path) for path in files]], cwd=root
+    )
+    if run_error:
+        return run_error.message
+    assert result is not None
+    if result.returncode != 0:
+        return result.stderr.strip() or "lizard XML coverage probe failed."
+    if not result.stdout.strip():
+        return "lizard XML coverage probe produced empty output."
+    reported_files, parse_error = parse_lizard_xml_files(result.stdout, root)
+    if parse_error:
+        return parse_error
+    return lizard_coverage_difference_error(reported_files, files, root)
+
+
+def run_lizard(
+    files: list[Path], root: Path, threshold: int, _require_tools: bool
+) -> tuple[list[Issue], list[ToolError], DetectorOutcome]:
+    outcome_files = tuple(relative_path(path, root) for path in files)
+    if not files:
+        return [], [], DetectorOutcome("not_applicable", "none", ())
+    lizard = shutil.which("lizard")
+    if not lizard:
+        message = "lizard is required for function complexity checks."
+        return [], [ToolError("lizard", message)], DetectorOutcome(
+            "missing", "none", outcome_files, message=message
+        )
+
+    result, run_error = run_detector(
+        [lizard, "--csv", *[str(path) for path in files]], cwd=root
+    )
+    if run_error:
+        return [], [run_error], DetectorOutcome(
+            "failed", "none", outcome_files, message=run_error.message
+        )
+    assert result is not None
+    if result.returncode not in {0, 1}:
+        message = result.stderr.strip() or "lizard failed."
+        return [], [ToolError("lizard", message)], DetectorOutcome(
+            "failed", "none", outcome_files, message=message
+        )
+    if not result.stdout.strip() and result.returncode == 1:
+        message = result.stderr.strip() or "lizard failed without CSV output."
+        return [], [ToolError("lizard", message)], DetectorOutcome(
+            "failed", "none", outcome_files, message=message
+        )
+
+    rows: list[dict[str, str]] = []
+    if result.stdout.strip():
+        rows, valid_csv = parse_lizard_csv(result.stdout)
+        if not valid_csv:
+            message = "lizard CSV output is missing required fields."
+            return [], [ToolError("lizard", message)], DetectorOutcome(
+                "failed", "none", outcome_files, message=message
+            )
+
+    expected_files = {path.resolve() for path in files}
+    issues, covered_files, parse_error = parse_lizard_rows(
+        rows, expected_files, root, threshold
+    )
+    if parse_error:
+        return [], [ToolError("lizard", parse_error)], DetectorOutcome(
+            "failed", "none", outcome_files, message=parse_error
+        )
+    uncovered_files = [path for path in files if path.resolve() not in covered_files]
+    coverage_error = (
+        lizard_xml_coverage_error(lizard, uncovered_files, root)
+        if uncovered_files
+        else None
+    )
+    if coverage_error:
+        return [], [ToolError("lizard", coverage_error)], DetectorOutcome(
+            "failed", "none", outcome_files, message=coverage_error
+        )
+    return issues, [], DetectorOutcome("succeeded", "complete", outcome_files)
+
+
+def parse_lizard_csv(output: str) -> tuple[list[dict[str, str]], bool]:
     required_fields = {"CCN", "location", "file", "function"}
     reader = csv.DictReader(io.StringIO(output))
     if reader.fieldnames and required_fields.issubset(set(reader.fieldnames)):
-        return list(reader)
+        return list(reader), True
 
     rows: list[dict[str, str]] = []
     for columns in csv.reader(io.StringIO(output)):
-        if len(columns) < LIZARD_CSV_MIN_COLUMNS:
+        if not columns or not any(column.strip() for column in columns):
             continue
+        if len(columns) < LIZARD_CSV_MIN_COLUMNS:
+            return [], False
         rows.append(
             {
                 "CCN": columns[LIZARD_CSV_CCN_INDEX],
@@ -1405,7 +1734,7 @@ def parse_lizard_csv(output: str) -> list[dict[str, str]]:
                 ),
             }
         )
-    return rows
+    return rows, bool(rows)
 
 
 def dedupe_issues(issues: list[Issue]) -> list[Issue]:
@@ -1432,38 +1761,123 @@ def dedupe_tool_errors(errors: list[ToolError]) -> list[ToolError]:
     return deduped
 
 
+def source_preflight_errors(files: list[Path], root: Path) -> list[ToolError]:
+    errors: list[ToolError] = []
+    for path in files:
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            tool = "python-ast" if path.suffix in PYTHON_EXTENSIONS else "source-read"
+            errors.append(
+                ToolError(
+                    tool,
+                    f"{relative_path(path, root)} could not be read as UTF-8 source: {exc}",
+                )
+            )
+            continue
+        if path.suffix not in PYTHON_EXTENSIONS:
+            continue
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:
+            errors.append(
+                ToolError(
+                    "python-ast",
+                    f"{relative_path(path, root)} could not be parsed by the Python runtime: {exc}",
+                )
+            )
+    return errors
+
+
+def with_fallback(outcome: DetectorOutcome, fallback: str) -> DetectorOutcome:
+    if outcome.status not in {"missing", "failed", "ignored"}:
+        return outcome
+    return dataclasses.replace(outcome, coverage="fallback", fallback=fallback)
+
+
+def apply_lizard_fallback(
+    files: list[Path],
+    root: Path,
+    threshold: int,
+    outcome: DetectorOutcome,
+) -> tuple[list[Issue], DetectorOutcome]:
+    python_files = [path for path in files if path.suffix in PYTHON_EXTENSIONS]
+    if not python_files or outcome.status not in {"missing", "failed"}:
+        return [], outcome
+    issues = [
+        issue
+        for path in python_files
+        for issue in scan_python_complexity_builtin(path, root, threshold)
+    ]
+    uncovered_files = tuple(
+        relative_path(path, root)
+        for path in files
+        if path.suffix not in PYTHON_EXTENSIONS
+    )
+    fallback_outcome = with_fallback(outcome, "python_ast")
+    return issues, dataclasses.replace(
+        fallback_outcome,
+        uncovered_files=uncovered_files,
+    )
+
+
+def detector_errors_for_scan(
+    results: tuple[tuple[list[ToolError], DetectorOutcome], ...], require_tools: bool
+) -> list[ToolError]:
+    return [
+        error
+        for errors, outcome in results
+        if require_tools or outcome.coverage == "none" or outcome.uncovered_files
+        for error in errors
+    ]
+
+
 def scan_files(
     files: list[Path], root: Path, threshold: int, require_tools: bool
-) -> tuple[list[Issue], list[ToolError]]:
+) -> tuple[list[Issue], list[ToolError], dict[str, DetectorOutcome]]:
     issues: list[Issue] = []
-    tool_errors: list[ToolError] = []
+    tool_errors = source_preflight_errors(files, root)
 
-    ruff_issues, ruff_errors, ruff_available = run_ruff(files, root, require_tools)
-    eslint_issues, eslint_errors, eslint_available = run_eslint(files, root, require_tools)
-    lizard_issues, lizard_errors, lizard_available = run_lizard(files, root, threshold, require_tools)
+    ruff_issues, ruff_errors, ruff_outcome = run_ruff(files, root, require_tools)
+    eslint_issues, eslint_errors, eslint_outcome = run_eslint(files, root, require_tools)
+    lizard_issues, lizard_errors, lizard_outcome = run_lizard(
+        files, root, threshold, require_tools
+    )
     issues.extend(ruff_issues)
     issues.extend(eslint_issues)
     issues.extend(lizard_issues)
 
-    if require_tools:
-        if not ruff_available:
-            tool_errors.extend(ruff_errors)
-        if not eslint_available:
-            tool_errors.extend(eslint_errors)
-        if not lizard_available:
-            tool_errors.extend(lizard_errors)
-        tool_errors.extend(
-            error for error in [*ruff_errors, *eslint_errors, *lizard_errors] if error not in tool_errors
-        )
+    if any(path.suffix in PYTHON_EXTENSIONS for path in files):
+        ruff_outcome = with_fallback(ruff_outcome, "builtin_literal_scan")
+
+    eslint_files = [path for path in files if path.suffix in JS_TS_EXTENSIONS]
+    has_typescript = any(path.suffix in TYPESCRIPT_EXTENSIONS for path in eslint_files)
+    if eslint_files and not has_typescript:
+        eslint_outcome = with_fallback(eslint_outcome, "builtin_literal_scan")
+
+    fallback_issues, lizard_outcome = apply_lizard_fallback(
+        files, root, threshold, lizard_outcome
+    )
+    issues.extend(fallback_issues)
+
+    detector_results = (
+        (ruff_errors, ruff_outcome),
+        (eslint_errors, eslint_outcome),
+        (lizard_errors, lizard_outcome),
+    )
+    tool_errors.extend(detector_errors_for_scan(detector_results, require_tools))
 
     for path in files:
         issues.extend(scan_magic_values_builtin(path, root))
         issues.extend(scan_python_public_api_docstrings(path, root))
         issues.extend(scan_python_pass_through_functions(path, root))
-        if not lizard_available and path.suffix in PYTHON_EXTENSIONS:
-            issues.extend(scan_python_complexity_builtin(path, root, threshold))
 
-    return dedupe_issues(issues), tool_errors
+    outcomes = {
+        "ruff": ruff_outcome,
+        "eslint": eslint_outcome,
+        "lizard": lizard_outcome,
+    }
+    return dedupe_issues(issues), dedupe_tool_errors(tool_errors), outcomes
 
 
 def render_feedback(
@@ -1601,10 +2015,13 @@ def main(argv: list[str]) -> int:
     metrics = collect_quality_metrics(files, root)
     ratchet, ratchet_errors = evaluate_ratchet(metrics, args.ratchet_baseline)
     detectors = detector_inventory()
-    strict_detector_errors = required_detector_errors(detectors) if args.require_tools else []
-    issues, tool_errors = scan_files(files, root, args.complexity_threshold, args.require_tools)
+    issues, tool_errors, detector_outcomes = scan_files(
+        files, root, args.complexity_threshold, args.require_tools
+    )
+    for detector, outcome in detector_outcomes.items():
+        detectors[detector]["run"] = outcome.to_schema()
     all_errors = dedupe_tool_errors(
-        [*input_errors, *rule_errors, *strict_detector_errors, *tool_errors, *ratchet_errors]
+        [*input_errors, *rule_errors, *tool_errors, *ratchet_errors]
     )
     if rules:
         missing_issue_rules = sorted({issue.rule_id for issue in issues} - set(rules))
