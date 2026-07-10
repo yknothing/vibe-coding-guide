@@ -17,12 +17,24 @@ native adapter 仍是 planned。adapter 能力、状态分级和输入/输出契
 
 ```bash
 python3 hooks/post_tool_use_quality_gate.py --doctor
-python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile python --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile all --require-tools
 ```
 
-Doctor 的 strict 检查面向完整安装清单；实际 scan 的 `--require-tools` 是
-profile-scoped，只要求本次文件类型适用的 detector。例如 Python-only scan 不要求
-ESLint，但仍要求 Ruff 和 lizard。
+Doctor 默认检查 `all`，也可选择 `python`、`javascript` 或 `typescript`。它会运行并自动清理
+clean 与已知违规 canary；只有 Python 3.11+、完整核心规则、所选 detector、clean pass，以及
+canary 同时触发 `IMP_004`/`IMP_007` 时，`strict_ready` 才为 `true`。版本命令成功不等于
+profile 可用。Doctor 自身不安装或下载依赖，但 detector 及其项目配置不受网络沙箱隔离。
+`javascript` 会覆盖 `.js/.jsx/.mjs/.cjs`，`typescript` 会覆盖 `.ts/.tsx`；monorepo 应以
+每个 package 为 `--root` 分别运行，不能用一个目录的 smoke 代表所有 package。
+若 TypeScript config 只覆盖特定目录，使用
+`--doctor --profile typescript --probe-dir src --require-tools` 明确指定。JSON 的
+`adapter_launch.generic_cli_argv/claude_hook_argv/environment` 固定本次验证的 project root、rules directory、Python 和 detector 绝对路径，IDE/CLI adapter
+应消费它们；ESLint 的绝对 Node runtime 也通过 `VCG_NODE_BIN` 固定。生成的命令携带
+`--scan-profile`，收到 doctor 未验收语言的文件会在 detector 执行前 fail closed，避免 GUI 环境与终端 `PATH`
+不一致或运行范围扩大。
+实际 scan 的 `--require-tools` 同样是 profile-scoped：Python-only scan 不要求 ESLint，
+但仍要求 Ruff 和 lizard。
 
 如果缺 detector，安装当前 strict mode 依赖：
 
@@ -31,20 +43,28 @@ ESLint，但仍要求 Ruff 和 lizard。
 | `ruff` | Fast Python linter | Python 魔法数字检测，使用 Ruff `PLR2004` 补强内置 AST fallback。 |
 | `lizard` | Cyclomatic complexity analyzer | 函数圈复杂度检测，用于 `IMP_007`。 |
 | `eslint` | JavaScript and TypeScript linter | JS 魔法数字检测；TypeScript 还要求可工作的 parser/config。被 ESLint 忽略的 TS 文件会 fail closed。 |
+| `typescript-eslint` | Project-local TypeScript tooling | 为 `.ts`/`.tsx` 提供 parser 和 flat config；只做 JavaScript 时不需要。 |
 
 ```bash
 python3 -m pip install --upgrade ruff lizard
+# JavaScript-only standalone path
 npm install -g eslint
+# TypeScript project path (run from a project with package.json)
+npm install --save-dev eslint @eslint/js typescript typescript-eslint
 ```
 
 安全边界：这些命令只供人工确认后执行；adapter 或安装器不得静默执行。使用 PyPI/npm、
 组织批准的内部镜像或 pinned/approved toolchain；不要使用 `curl | sh` 式安装脚本；如果不允许
-global npm install，或目标环境不是 macOS/Linux shell，就在项目或受控工具环境中使用等价安装方式，
-并确保 `eslint` 在 hook 的 `PATH` 中。
+global npm install，或目标环境不是 macOS/Linux shell，就在项目或受控工具环境中使用等价安装方式。
+Python 工具应装在专用 virtual environment、`pipx` 或组织批准的工具环境中；不要污染系统 Python。
+core 只对 ESLint 优先使用 `<project-root>/node_modules/.bin/eslint`，再回退到系统 `PATH`；
+Ruff/lizard 不会从项目 `node_modules/.bin` 执行。TypeScript 项目还需在
+项目根添加匹配 `.ts`/`.tsx` 的 `eslint.config.*`；doctor 会实际扫描临时 `.ts` 文件验证它。
+`eslint.config.*` 是可执行代码，只应在已信任并已评审配置的仓库中运行 doctor 或 strict scan。
 安装后必须重跑：
 
 ```bash
-python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile all --require-tools
 ```
 
 再跑最小验证：

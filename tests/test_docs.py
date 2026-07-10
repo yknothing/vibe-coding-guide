@@ -39,9 +39,19 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("Cyclomatic complexity analyzer", combined)
         self.assertIn("python3 -m pip install --upgrade ruff lizard", combined)
         self.assertIn("npm install -g eslint", combined)
+        self.assertIn(
+            "npm install --save-dev eslint @eslint/js typescript typescript-eslint",
+            combined,
+        )
+        self.assertIn("<project-root>/node_modules/.bin/eslint", combined)
+        self.assertIn("--probe-dir", combined)
+        self.assertIn("adapter_launch.generic_cli_argv", combined)
+        self.assertIn("adapter_launch.claude_hook_argv", combined)
+        self.assertIn("adapter_launch.environment", combined)
+        self.assertIn("adapter_launch.project_root/rules_dir", combined)
         self.assertIn("Do not use `curl | sh`", combined)
         self.assertIn("不得静默执行", combined)
-        self.assertIn("--doctor --require-tools", combined)
+        self.assertIn("--doctor --profile all --require-tools", combined)
 
     def test_adapter_docs_keep_doctor_install_fields_out_of_scan_report_contract(self) -> None:
         adapters = (ROOT / "docs" / "ADAPTERS.md").read_text(encoding="utf-8")

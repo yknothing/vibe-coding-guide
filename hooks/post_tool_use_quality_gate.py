@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import csv
 import dataclasses
 import datetime as dt
@@ -13,9 +14,11 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -36,6 +39,40 @@ REQUEST_SCHEMA_VERSION = "quality-gate-request/v1"
 TOOL_TIMEOUT_SECONDS = 30
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
 REQUIRED_DETECTORS = ("ruff", "eslint", "lizard")
+DETECTOR_OVERRIDE_ENV = {
+    "ruff": "VCG_RUFF_BIN",
+    "eslint": "VCG_ESLINT_BIN",
+    "lizard": "VCG_LIZARD_BIN",
+}
+NODE_OVERRIDE_ENV = "VCG_NODE_BIN"
+DOCTOR_REQUIRED_RULES = ("DSN_001", "IMP_004", "IMP_007", "MNT_001", "MNT_002")
+MINIMUM_PYTHON_VERSION = (3, 11)
+DOCTOR_PROFILE_DETECTORS = {
+    "python": ("ruff", "lizard"),
+    "javascript": ("eslint", "lizard"),
+    "typescript": ("eslint", "lizard"),
+}
+DOCTOR_PROFILE_EXTENSIONS = {
+    "python": (".py",),
+    "javascript": (".js", ".jsx", ".mjs", ".cjs"),
+    "typescript": (".ts", ".tsx"),
+}
+DOCTOR_CANARY_RULES = ("IMP_004", "IMP_007")
+DOCTOR_MAX_CANARY_THRESHOLD = 100
+DOCTOR_PROFILE_CLEAN_SOURCE = {
+    "python": 'APP_NAME = "demo"\n',
+    "javascript": 'const LABEL = "ok";\n',
+    "typescript": 'export const LABEL: string = "ok";\n',
+}
+TYPESCRIPT_PROFILE_SETUP = {
+    "description": "Project-local TypeScript support for ESLint flat config.",
+    "purpose": "Provides a TypeScript parser and configuration that can lint .ts/.tsx files.",
+    "install_command": "npm install --save-dev eslint @eslint/js typescript typescript-eslint",
+    "config_requirement": "Add eslint.config.mjs (or another supported eslint.config.*) at the project root and include TypeScript files.",
+    "verify_command": "npx eslint path/to/file.ts",
+    "documentation": "https://typescript-eslint.io/getting-started/",
+    "security_note": "Run only in a trusted project because eslint.config.* is executable code. Use npm or an approved internal registry, review package.json and the lockfile, and do not use curl | sh installers.",
+}
 DETECTOR_INSTALLS: dict[str, dict[str, str]] = {
     "ruff": {
         "tool": "ruff",
@@ -266,6 +303,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--doctor",
         action="store_true",
         help="Check local dependencies, rule loading, and adapter readiness.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("all", "python", "javascript", "typescript"),
+        default="all",
+        help="Language profile to verify in doctor mode.",
+    )
+    parser.add_argument(
+        "--probe-dir",
+        help="Project-relative source directory for doctor fixtures when config is scoped.",
+    )
+    parser.add_argument(
+        "--scan-profile",
+        choices=("all", "python", "javascript", "typescript"),
+        default="all",
+        help="Fail closed if scan inputs exceed the language profile certified by doctor.",
     )
     parser.add_argument(
         "--hook",
@@ -573,12 +626,69 @@ def run_detector(
         return None, ToolError(tool, f"{tool} could not run: {exc}")
 
 
-def command_version(command: str) -> str | None:
-    result, error = run_detector([command, "--version"])
+def command_version(command: str | list[str]) -> str | None:
+    command_prefix = [command] if isinstance(command, str) else command
+    result, error = run_detector([*command_prefix, "--version"])
     if error or result is None or result.returncode != 0:
         return None
     version = (result.stdout or result.stderr).strip().splitlines()
     return version[0] if version else None
+
+
+def find_detector(detector: str, root: Path | None = None) -> str | None:
+    override = os.environ.get(DETECTOR_OVERRIDE_ENV[detector])
+    if override:
+        return executable_path(Path(override).expanduser())
+    if detector == "eslint" and root is not None:
+        local_path = shutil.which(detector, path=str(root / "node_modules" / ".bin"))
+        if local_path:
+            return str(Path(local_path).resolve())
+    path = shutil.which(detector)
+    if path:
+        return str(Path(path).resolve())
+    if detector == "eslint":
+        return None
+    sibling_name = f"{detector}.exe" if os.name == "nt" else detector
+    return executable_path(Path(sys.executable).resolve().parent / sibling_name)
+
+
+def executable_path(path: Path) -> str | None:
+    resolved = path.resolve()
+    if resolved.is_file() and (os.name == "nt" or os.access(resolved, os.X_OK)):
+        return str(resolved)
+    return None
+
+
+def find_node_runtime(eslint: str | None = None) -> str | None:
+    override = os.environ.get(NODE_OVERRIDE_ENV)
+    if override:
+        return executable_path(Path(override).expanduser())
+    if eslint:
+        sibling_name = "node.exe" if os.name == "nt" else "node"
+        sibling = executable_path(Path(eslint).resolve().parent / sibling_name)
+        if sibling:
+            return sibling
+    path = shutil.which("node")
+    return str(Path(path).resolve()) if path else None
+
+
+def eslint_command_prefix(eslint: str, platform_name: str = os.name) -> list[str]:
+    node = find_node_runtime(eslint)
+    if node:
+        entrypoint = windows_eslint_entrypoint(eslint) if platform_name == "nt" else eslint
+        return [node, entrypoint]
+    return [eslint]
+
+
+def windows_eslint_entrypoint(eslint: str) -> str:
+    eslint_path = Path(eslint).resolve()
+    if eslint_path.suffix.lower() in {".js", ".mjs", ".cjs"}:
+        return str(eslint_path)
+    candidates = (
+        eslint_path.parent.parent / "eslint" / "bin" / "eslint.js",
+        eslint_path.parent / "node_modules" / "eslint" / "bin" / "eslint.js",
+    )
+    return str(next((path.resolve() for path in candidates if path.is_file()), eslint_path))
 
 
 def detector_install_info(detector: str) -> dict[str, str]:
@@ -595,14 +705,41 @@ def detector_install_info(detector: str) -> dict[str, str]:
     }
 
 
-def detector_inventory(include_install: bool = False) -> dict[str, dict[str, Any]]:
+def detector_install_info_for_profiles(
+    detector: str, profiles: tuple[str, ...]
+) -> dict[str, str]:
+    info = detector_install_info(detector)
+    if detector == "eslint" and "typescript" in profiles:
+        for field in (
+            "purpose",
+            "install_command",
+            "config_requirement",
+            "verify_command",
+            "documentation",
+            "security_note",
+        ):
+            info[field] = TYPESCRIPT_PROFILE_SETUP[field]
+    return info
+
+
+def detector_inventory(
+    root: Path | None = None, include_install: bool = False
+) -> dict[str, dict[str, Any]]:
     inventory: dict[str, dict[str, Any]] = {}
     for detector in REQUIRED_DETECTORS:
-        path = shutil.which(detector)
+        path = find_detector(detector, root)
         info: dict[str, Any] = {
             "available": path is not None,
             "path": path,
-            "version": command_version(path) if path else None,
+            "version": (
+                command_version(eslint_command_prefix(path))
+                if path and detector == "eslint"
+                else command_version(path)
+                if path
+                else None
+            ),
+            "override_env": DETECTOR_OVERRIDE_ENV[detector],
+            "override_value": os.environ.get(DETECTOR_OVERRIDE_ENV[detector]),
         }
         if include_install:
             info["install"] = detector_install_info(detector)
@@ -610,8 +747,8 @@ def detector_inventory(include_install: bool = False) -> dict[str, dict[str, Any
     return inventory
 
 
-def detector_remediation(detector: str) -> str:
-    info = detector_install_info(detector)
+def detector_remediation(detector: str, profiles: tuple[str, ...] = ()) -> str:
+    info = detector_install_info_for_profiles(detector, profiles)
     return (
         f"{info['description']} {info['purpose']} "
         f"Install with `{info['install_command']}` and verify with `{info['verify_command']}`. "
@@ -619,27 +756,41 @@ def detector_remediation(detector: str) -> str:
     )
 
 
-def detector_install_plan(detectors: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+def detector_install_plan(
+    detectors: dict[str, dict[str, Any]],
+    required_detectors: tuple[str, ...] = REQUIRED_DETECTORS,
+    profiles: tuple[str, ...] = (),
+) -> list[dict[str, str]]:
     return [
-        detector_install_info(detector)
-        for detector in REQUIRED_DETECTORS
+        detector_install_info_for_profiles(detector, profiles)
+        for detector in required_detectors
         if not detectors.get(detector, {}).get("available")
     ]
 
 
 def quick_install_commands(install_plan: list[dict[str, str]]) -> list[str]:
     missing = {item["tool"] for item in install_plan}
+    commands_by_tool = {item["tool"]: item["install_command"] for item in install_plan}
     commands: list[str] = []
     python_tools = [detector for detector in ("ruff", "lizard") if detector in missing]
     if python_tools:
         commands.append(f"python3 -m pip install --upgrade {' '.join(python_tools)}")
     if "eslint" in missing:
-        commands.append("npm install -g eslint")
-    for item in install_plan:
-        command = item["install_command"]
-        if item["tool"] not in {"ruff", "lizard", "eslint"} and command not in commands:
-            commands.append(command)
+        commands.append(commands_by_tool["eslint"])
+    commands.extend(custom_install_commands(install_plan, commands))
     return commands
+
+
+def custom_install_commands(
+    install_plan: list[dict[str, str]], existing_commands: list[str]
+) -> list[str]:
+    standard_tools = {"ruff", "lizard", "eslint"}
+    return [
+        item["install_command"]
+        for item in install_plan
+        if item["tool"] not in standard_tools
+        and item["install_command"] not in existing_commands
+    ]
 
 
 def report_source(request: QualityGateRequest) -> dict[str, Any]:
@@ -655,65 +806,432 @@ def doctor_status(checks: list[DoctorCheck]) -> str:
     return "pass"
 
 
-def build_doctor_report(root: Path, rules_dir: Path, require_tools: bool) -> dict[str, Any]:
-    checks: list[DoctorCheck] = []
-    checks.append(
-        DoctorCheck(
-            id="python.runtime",
-            status="pass",
-            message=f"Python runtime: {platform.python_version()}",
-            detail={"executable": sys.executable, "version": platform.python_version()},
+def python_runtime_check(
+    version_info: tuple[int, ...] = tuple(sys.version_info[:3]),
+    version: str = platform.python_version(),
+) -> DoctorCheck:
+    supported = version_info >= MINIMUM_PYTHON_VERSION
+    minimum = ".".join(str(part) for part in MINIMUM_PYTHON_VERSION)
+    return DoctorCheck(
+        id="python.runtime",
+        status="pass" if supported else "fail",
+        message=f"Python runtime: {version}",
+        detail={
+            "executable": sys.executable,
+            "version": version,
+            "minimum_version": minimum,
+        },
+        remediation=None if supported else f"Install and run with Python {minimum} or newer.",
+    )
+
+
+def selected_doctor_profiles(profile: str) -> tuple[str, ...]:
+    if profile == "all":
+        return tuple(DOCTOR_PROFILE_DETECTORS)
+    return (profile,)
+
+
+def required_profile_detectors(profiles: tuple[str, ...]) -> tuple[str, ...]:
+    required = {
+        detector
+        for profile in profiles
+        for detector in DOCTOR_PROFILE_DETECTORS[profile]
+    }
+    return tuple(detector for detector in REQUIRED_DETECTORS if detector in required)
+
+
+def profile_remediation(profile: str) -> str:
+    if profile == "typescript":
+        return (
+            f"Install project-local TypeScript lint support with "
+            f"`{TYPESCRIPT_PROFILE_SETUP['install_command']}`, add a matching "
+            "eslint.config.* file that enables the TypeScript parser, verify with "
+            f"`{TYPESCRIPT_PROFILE_SETUP['verify_command']}`, then rerun "
+            "--doctor --profile typescript --probe-dir <covered-source-dir> --require-tools. "
+            "Do not install silently."
+        )
+    tools = " and ".join(DOCTOR_PROFILE_DETECTORS[profile])
+    return f"Install and verify {tools}, then rerun --doctor --profile {profile}."
+
+
+def doctor_canary_source(profile: str, complexity_threshold: int) -> str:
+    values = range(2, complexity_threshold + 2)
+    if profile == "python":
+        conditions = "".join(
+            f"    if value == {value}:\n        return '{value}'\n" for value in values
+        )
+        return f"def classify(value):\n{conditions}    return 'other'\n"
+    parameter = "value: number" if profile == "typescript" else "value"
+    return_type = ": string" if profile == "typescript" else ""
+    conditions = "".join(
+        f"  if (value === {value}) return '{value}';\n" for value in values
+    )
+    export_prefix = "export " if profile == "typescript" else ""
+    return (
+        f"{export_prefix}function classify({parameter}){return_type} {{\n"
+        f"{conditions}  return 'other';\n}}\n"
+    )
+
+
+def run_doctor_profile_probe(
+    profile: str,
+    rules: dict[str, Rule],
+    project_root: Path,
+    probe_directory_override: Path | None = None,
+) -> dict[str, Any]:
+    probe_directory: Path | None = None
+    try:
+        probe_directory = doctor_profile_probe_directory(
+            profile, project_root, probe_directory_override
+        )
+        complexity_threshold = int(rules["IMP_007"].gate["threshold"])
+        with doctor_fixture_targets(
+            profile, probe_directory, complexity_threshold
+        ) as targets:
+            return execute_doctor_profile_probe(
+                profile, rules, project_root, probe_directory, targets
+            )
+    except OSError as exc:
+        message = f"Could not create or use the doctor fixture under {project_root}: {exc}"
+        return {
+            "status": "fail",
+            "reason": "fixture_setup_failed",
+            "required_detectors": list(DOCTOR_PROFILE_DETECTORS[profile]),
+            "expected_canary_rule_ids": list(DOCTOR_CANARY_RULES),
+            "probe_directory": (
+                relative_path(probe_directory, project_root)
+                if probe_directory is not None
+                else None
+            ),
+            "probes": {},
+            "tool_errors": [{"tool": "doctor-fixture", "message": message}],
+            "setup": TYPESCRIPT_PROFILE_SETUP if profile == "typescript" else None,
+            "remediation": "Use a writable project root, then rerun doctor.",
+        }
+
+
+def doctor_profile_probe_directory(
+    profile: str, project_root: Path, override: Path | None = None
+) -> Path:
+    if override is not None:
+        return override
+    if profile != "typescript":
+        return project_root
+    excluded_directories = {".git", ".venv", "dist", "build", "node_modules", "vendor"}
+    for current_root, directories, filenames in os.walk(project_root):
+        directories[:] = sorted(
+            directory for directory in directories if directory not in excluded_directories
+        )
+        for filename in sorted(filenames):
+            if is_typescript_probe_source(filename):
+                return Path(current_root).resolve()
+    for common_directory in ("src", "app", "lib"):
+        candidate = project_root / common_directory
+        if candidate.is_dir():
+            return candidate.resolve()
+    return project_root
+
+
+def is_typescript_probe_source(filename: str) -> bool:
+    return (
+        Path(filename).suffix in TYPESCRIPT_EXTENSIONS
+        and not filename.endswith(".d.ts")
+        and not filename.startswith(("eslint.config.", "vcg-doctor-"))
+    )
+
+
+@contextlib.contextmanager
+def doctor_fixture_targets(
+    profile: str, probe_directory: Path, complexity_threshold: int
+):
+    targets: dict[str, list[Path]] = {"clean": [], "canary": []}
+    probe_sources = {
+        "clean": DOCTOR_PROFILE_CLEAN_SOURCE[profile],
+        "canary": doctor_canary_source(profile, complexity_threshold),
+    }
+    with contextlib.ExitStack() as cleanup:
+        for probe_name, content in probe_sources.items():
+            for extension in DOCTOR_PROFILE_EXTENSIONS[profile]:
+                descriptor, raw_path = tempfile.mkstemp(
+                    prefix=f"vcg-doctor-{profile}-{probe_name}-",
+                    suffix=extension,
+                    dir=probe_directory,
+                )
+                os.close(descriptor)
+                target = Path(raw_path).resolve()
+                cleanup.callback(target.unlink, missing_ok=True)
+                target.write_text(content, encoding="utf-8")
+                targets[probe_name].append(target)
+        yield targets
+
+
+def execute_doctor_probe_scan(
+    profile: str,
+    probe_name: str,
+    targets: list[Path],
+    rules: dict[str, Rule],
+    project_root: Path,
+) -> dict[str, Any]:
+    request = QualityGateRequest(
+        schema_version=REQUEST_SCHEMA_VERSION,
+        root=project_root,
+        files=tuple(relative_path(target, project_root) for target in targets),
+        mode="doctor_probe",
+        adapter="doctor",
+        hook_event_name=None,
+        tool_name=None,
+        baseline_path=None,
+        strict=True,
+        complexity_threshold=None,
+        complexity_threshold_source=None,
+    )
+    policy, policy_errors = effective_policy(request, rules)
+    files, skipped = resolve_scan_files(list(request.files), request.root)
+    issues, tool_errors, outcomes = scan_files(
+        files,
+        request.root,
+        policy["complexity_threshold"],
+        request.strict,
+    )
+    issues = apply_rule_metadata(issues, rules)
+    errors = dedupe_tool_errors([*policy_errors, *tool_errors])
+    decision = build_decision(
+        issues,
+        errors,
+        files,
+        {"status": "not_configured", "violations": []},
+    )
+    return {
+        "expected_decision": "pass" if probe_name == "clean" else "block",
+        "expected_rule_ids": [] if probe_name == "clean" else list(DOCTOR_CANARY_RULES),
+        "decision": decision,
+        "rule_ids": sorted({issue.rule_id for issue in issues}),
+        "detector_evidence": issue_detector_evidence(issues),
+        "evidence_by_file": issue_evidence_by_file(issues, files, project_root),
+        "detectors": profile_detector_schemas(profile, outcomes),
+        "scanned_files": [relative_path(path, project_root) for path in files],
+        "skipped_files": [dataclasses.asdict(item) for item in skipped],
+        "tool_errors": [dataclasses.asdict(error) for error in errors],
+    }
+
+
+def issue_detector_evidence(issues: list[Issue]) -> list[str]:
+    return sorted(
+        {
+            str(issue.metric_values["detector"])
+            for issue in issues
+            if issue.metric_values and issue.metric_values.get("detector")
+        }
+    )
+
+
+def issue_evidence_by_file(
+    issues: list[Issue], files: list[Path], root: Path
+) -> dict[str, dict[str, list[str]]]:
+    evidence = {
+        relative_path(path, root): {"rule_ids": [], "detectors": []} for path in files
+    }
+    for issue in issues:
+        file_evidence = evidence.get(issue.file_path)
+        if file_evidence is None:
+            continue
+        file_evidence["rule_ids"].append(issue.rule_id)
+        detector = issue.metric_values.get("detector") if issue.metric_values else None
+        if detector:
+            file_evidence["detectors"].append(str(detector))
+    for file_evidence in evidence.values():
+        file_evidence["rule_ids"] = sorted(set(file_evidence["rule_ids"]))
+        file_evidence["detectors"] = sorted(set(file_evidence["detectors"]))
+    return evidence
+
+
+def profile_detector_schemas(
+    profile: str, outcomes: dict[str, DetectorOutcome]
+) -> dict[str, dict[str, Any]]:
+    required = DOCTOR_PROFILE_DETECTORS[profile]
+    return {
+        name: outcome.to_schema()
+        for name, outcome in outcomes.items()
+        if name in required
+    }
+
+
+def doctor_probe_detector_coverage_passed(
+    probe: dict[str, Any], required_detectors: tuple[str, ...]
+) -> bool:
+    return all(
+        probe["detectors"].get(detector, {}).get("status") == "succeeded"
+        and probe["detectors"].get(detector, {}).get("coverage") == "complete"
+        for detector in required_detectors
+    )
+
+
+def doctor_profile_probes_passed(
+    probes: dict[str, dict[str, Any]], required_detectors: tuple[str, ...]
+) -> bool:
+    clean = probes["clean"]
+    canary = probes["canary"]
+    canary_rules = set(canary["decision"]["rule_ids"]["block"])
+    detector_evidence = set(canary["detector_evidence"])
+    return (
+        clean["decision"]["outcome"] == "pass"
+        and not clean["skipped_files"]
+        and canary["decision"]["outcome"] == "block"
+        and not canary["skipped_files"]
+        and set(DOCTOR_CANARY_RULES).issubset(canary_rules)
+        and set(required_detectors).issubset(detector_evidence)
+        and canary_file_evidence_passed(canary, required_detectors)
+        and all(
+            doctor_probe_detector_coverage_passed(probe, required_detectors)
+            for probe in probes.values()
         )
     )
-    checks.append(
+
+
+def canary_file_evidence_passed(
+    canary: dict[str, Any], required_detectors: tuple[str, ...]
+) -> bool:
+    expected_rules = set(DOCTOR_CANARY_RULES)
+    expected_detectors = set(required_detectors)
+    return all(
+        expected_rules.issubset(set(file_evidence["rule_ids"]))
+        and expected_detectors.issubset(set(file_evidence["detectors"]))
+        for file_evidence in canary["evidence_by_file"].values()
+    ) and bool(canary["evidence_by_file"])
+
+
+def execute_doctor_profile_probe(
+    profile: str,
+    rules: dict[str, Rule],
+    project_root: Path,
+    probe_directory: Path,
+    targets: dict[str, list[Path]],
+) -> dict[str, Any]:
+    required_detectors = DOCTOR_PROFILE_DETECTORS[profile]
+    probes = {
+        name: execute_doctor_probe_scan(profile, name, paths, rules, project_root)
+        for name, paths in targets.items()
+    }
+    passed = doctor_profile_probes_passed(probes, required_detectors)
+    tool_errors = list(
+        {
+            (error["tool"], error["message"]): error
+            for probe in probes.values()
+            for error in probe["tool_errors"]
+        }.values()
+    )
+    return {
+        "status": "pass" if passed else "fail",
+        "reason": None if passed else "probe_expectation_failed",
+        "required_detectors": list(required_detectors),
+        "expected_canary_rule_ids": list(DOCTOR_CANARY_RULES),
+        "probe_directory": relative_path(probe_directory, project_root) or ".",
+        "probes": probes,
+        "tool_errors": tool_errors,
+        "setup": TYPESCRIPT_PROFILE_SETUP if profile == "typescript" else None,
+        "remediation": None if passed else profile_remediation(profile),
+    }
+
+
+def doctor_environment_checks(root: Path) -> tuple[list[DoctorCheck], DoctorCheck]:
+    runtime_check = python_runtime_check()
+    root_is_directory = root.is_dir()
+    script_executable = os.access(__file__, os.X_OK)
+    checks = [
+        runtime_check,
         DoctorCheck(
             id="project.root",
-            status="pass" if root.exists() else "fail",
-            message=f"Project root {'exists' if root.exists() else 'does not exist'}: {root}",
+            status="pass" if root_is_directory else "fail",
+            message=(
+                f"Project root is a directory: {root}"
+                if root_is_directory
+                else f"Project root is missing or not a directory: {root}"
+            ),
             detail={"root": root.as_posix()},
-            remediation=None if root.exists() else "Pass --root or run the command from the project root.",
-        )
-    )
-    checks.append(
+            remediation=None
+            if root_is_directory
+            else "Pass --root or run the command from the project root.",
+        ),
         DoctorCheck(
             id="script.executable",
-            status="pass" if os.access(__file__, os.X_OK) else "warn",
+            status="pass" if script_executable else "warn",
             message=(
                 "Hook script is executable."
-                if os.access(__file__, os.X_OK)
+                if script_executable
                 else "Hook script is not executable; invoke it with python3 or chmod +x it."
             ),
             detail={"path": Path(__file__).resolve().as_posix()},
-            remediation=None if os.access(__file__, os.X_OK) else "Run via `python3` or set executable bit.",
+            remediation=None
+            if script_executable
+            else "Run via `python3` or set executable bit.",
+        ),
+    ]
+    return checks, runtime_check
+
+
+def doctor_rules_check(
+    rules_dir: Path,
+) -> tuple[dict[str, Rule], list[str], DoctorCheck]:
+    try:
+        rules = load_rules(rules_dir)
+    except RuleValidationError as exc:
+        return {}, [], DoctorCheck(
+            id="rules.load",
+            status="fail",
+            message=str(exc),
+            detail={"rules_dir": rules_dir.as_posix()},
+            remediation="Fix the rule YAML or pass a valid --rules-dir.",
         )
+    loaded_rules = sorted(rules)
+    missing_rules = sorted(set(DOCTOR_REQUIRED_RULES) - set(rules))
+    if missing_rules:
+        return rules, loaded_rules, DoctorCheck(
+            id="rules.load",
+            status="fail",
+            message=f"Missing required quality gate rule(s): {', '.join(missing_rules)}.",
+            detail={
+                "rules_dir": rules_dir.as_posix(),
+                "rules": loaded_rules,
+                "required_rules": list(DOCTOR_REQUIRED_RULES),
+                "missing_rules": missing_rules,
+            },
+            remediation="Restore the required rule YAML files, then rerun doctor.",
+        )
+    complexity_threshold = int(rules["IMP_007"].gate["threshold"])
+    if complexity_threshold > DOCTOR_MAX_CANARY_THRESHOLD:
+        return rules, loaded_rules, DoctorCheck(
+            id="rules.load",
+            status="fail",
+            message=(
+                f"IMP_007 threshold {complexity_threshold} exceeds the doctor canary limit "
+                f"{DOCTOR_MAX_CANARY_THRESHOLD}."
+            ),
+            detail={
+                "rules_dir": rules_dir.as_posix(),
+                "rules": loaded_rules,
+                "complexity_threshold": complexity_threshold,
+                "doctor_canary_limit": DOCTOR_MAX_CANARY_THRESHOLD,
+            },
+            remediation="Use a probeable complexity threshold, then rerun doctor.",
+        )
+    return rules, loaded_rules, DoctorCheck(
+        id="rules.load",
+        status="pass",
+        message=f"Loaded {len(loaded_rules)} rule(s).",
+        detail={"rules_dir": rules_dir.as_posix(), "rules": loaded_rules},
+        remediation=None,
     )
 
-    loaded_rules: list[str] = []
-    try:
-        loaded_rules = sorted(load_rules(rules_dir))
-        checks.append(
-            DoctorCheck(
-                id="rules.load",
-                status="pass",
-                message=f"Loaded {len(loaded_rules)} rule(s).",
-                detail={"rules_dir": rules_dir.as_posix(), "rules": loaded_rules},
-                remediation=None,
-            )
-        )
-    except RuleValidationError as exc:
-        checks.append(
-            DoctorCheck(
-                id="rules.load",
-                status="fail",
-                message=str(exc),
-                detail={"rules_dir": rules_dir.as_posix()},
-                remediation="Fix the rule YAML or pass a valid --rules-dir.",
-            )
-        )
 
-    detectors = detector_inventory(include_install=True)
-    install_plan = detector_install_plan(detectors)
-    for detector, info in detectors.items():
+def doctor_detector_checks(
+    detectors: dict[str, dict[str, Any]],
+    required_detectors: tuple[str, ...],
+    profiles: tuple[str, ...],
+    require_tools: bool,
+) -> list[DoctorCheck]:
+    checks: list[DoctorCheck] = []
+    for detector in required_detectors:
+        info = detectors[detector]
         available = bool(info["available"])
         checks.append(
             DoctorCheck(
@@ -725,25 +1243,291 @@ def build_doctor_report(root: Path, rules_dir: Path, require_tools: bool) -> dic
                     else f"{detector} not found; strict --require-tools mode will fail closed."
                 ),
                 detail=info,
-                remediation=None if available else detector_remediation(detector),
+                remediation=None
+                if available
+                else detector_remediation(detector, profiles),
             )
         )
+    return checks
 
-    strict_ready = all(bool(info["available"]) for info in detectors.values()) and all(
+
+def unavailable_profile_probe(profile: str) -> dict[str, Any]:
+    return {
+        "status": "fail",
+        "reason": "prerequisites_unmet",
+        "required_detectors": list(DOCTOR_PROFILE_DETECTORS[profile]),
+        "expected_canary_rule_ids": list(DOCTOR_CANARY_RULES),
+        "probe_directory": None,
+        "probes": {},
+        "tool_errors": [],
+        "setup": TYPESCRIPT_PROFILE_SETUP if profile == "typescript" else None,
+        "remediation": (
+            "Resolve the failed runtime, rule, or detector checks. "
+            f"Then rerun --doctor --profile {profile} --require-tools."
+        ),
+    }
+
+
+def doctor_profile_checks(
+    profiles: tuple[str, ...],
+    rules: dict[str, Rule],
+    rules_ready: bool,
+    runtime_ready: bool,
+    project_root: Path,
+    probe_directory: Path | None,
+    probe_directory_ready: bool,
+    detectors: dict[str, dict[str, Any]],
+    require_tools: bool,
+) -> tuple[dict[str, dict[str, Any]], list[DoctorCheck]]:
+    results: dict[str, dict[str, Any]] = {}
+    checks: list[DoctorCheck] = []
+    for profile in profiles:
+        detector_names = DOCTOR_PROFILE_DETECTORS[profile]
+        detectors_ready = all(bool(detectors[name]["available"]) for name in detector_names)
+        result = (
+            run_doctor_profile_probe(profile, rules, project_root, probe_directory)
+            if doctor_profile_prerequisites_ready(
+                runtime_ready,
+                rules_ready,
+                project_root,
+                probe_directory_ready,
+                detectors_ready,
+            )
+            else unavailable_profile_probe(profile)
+        )
+        passed = result["status"] == "pass"
+        results[profile] = result
+        checks.append(
+            DoctorCheck(
+                id=f"profile.{profile}.smoke",
+                status=doctor_profile_check_status(passed, require_tools),
+                message=(
+                    f"{profile} profile smoke passed."
+                    if passed
+                    else f"{profile} profile smoke failed."
+                ),
+                detail=result,
+                remediation=result["remediation"],
+            )
+        )
+    return results, checks
+
+
+def doctor_profile_prerequisites_ready(
+    runtime_ready: bool,
+    rules_ready: bool,
+    project_root: Path,
+    probe_directory_ready: bool,
+    detectors_ready: bool,
+) -> bool:
+    return all(
+        (
+            runtime_ready,
+            rules_ready,
+            project_root.is_dir(),
+            probe_directory_ready,
+            detectors_ready,
+        )
+    )
+
+
+def doctor_profile_check_status(passed: bool, require_tools: bool) -> str:
+    if passed:
+        return "pass"
+    return "fail" if require_tools else "warn"
+
+
+def requested_doctor_probe_directory(
+    project_root: Path, raw_probe_directory: str | None
+) -> tuple[Path | None, DoctorCheck | None]:
+    if raw_probe_directory is None:
+        return None, None
+    raw_path = Path(raw_probe_directory).expanduser()
+    candidate = (raw_path if raw_path.is_absolute() else project_root / raw_path).resolve()
+    try:
+        candidate.relative_to(project_root)
+        inside_root = True
+    except ValueError:
+        inside_root = False
+    valid = inside_root and candidate.is_dir()
+    check = DoctorCheck(
+        id="probe.directory",
+        status="pass" if valid else "fail",
+        message=(
+            f"Doctor probe directory: {candidate}"
+            if valid
+            else f"Doctor probe directory must be an existing directory under {project_root}."
+        ),
+        detail={
+            "requested": raw_probe_directory,
+            "resolved": candidate.as_posix(),
+            "inside_root": inside_root,
+        },
+        remediation=None
+        if valid
+        else "Pass a project-relative --probe-dir covered by the selected language config.",
+    )
+    return (candidate if valid else None), check
+
+
+def adapter_launch_contract(
+    detectors: dict[str, dict[str, Any]],
+    requested_profiles: tuple[str, ...],
+    validated_profiles: tuple[str, ...],
+    ready: bool,
+    project_root: Path,
+    rules_dir: Path,
+) -> dict[str, Any]:
+    core_argv = [str(Path(sys.executable).resolve()), str(Path(__file__).resolve())]
+    scan_profile = (
+        validated_profiles[0] if len(validated_profiles) == 1 else "all"
+    ) if ready else None
+    environment = {
+        DETECTOR_OVERRIDE_ENV[detector]: str(info["path"])
+        for detector, info in detectors.items()
+        if info.get("path")
+    }
+    node_runtime = find_node_runtime(detectors["eslint"].get("path"))
+    if node_runtime:
+        environment[NODE_OVERRIDE_ENV] = node_runtime
+    pinned_arguments = [
+        "--root",
+        str(project_root.resolve()),
+        "--rules-dir",
+        str(rules_dir.resolve()),
+        "--require-tools",
+        "--scan-profile",
+        str(scan_profile),
+    ]
+    generic_cli_argv = (
+        [
+            *core_argv,
+            "--format",
+            "json",
+            *pinned_arguments,
+        ]
+        if ready
+        else None
+    )
+    claude_hook_argv = (
+        [
+            *core_argv,
+            "--hook",
+            *pinned_arguments,
+        ]
+        if ready
+        else None
+    )
+    assignments = [f"{name}={shlex.quote(path)}" for name, path in environment.items()]
+    claude_posix_command = (
+        " ".join([*assignments, shlex.join(claude_hook_argv)])
+        if claude_hook_argv
+        else None
+    )
+    return {
+        "ready": ready,
+        "core_argv": core_argv,
+        "generic_cli_argv": generic_cli_argv,
+        "claude_hook_argv": claude_hook_argv,
+        "environment": environment,
+        "requested_profiles": list(requested_profiles),
+        "validated_profiles": list(validated_profiles),
+        "scan_profile": scan_profile,
+        "project_root": str(project_root.resolve()),
+        "rules_dir": str(rules_dir.resolve()),
+        "node_runtime": node_runtime,
+        "claude_posix_command": claude_posix_command,
+        "notes": (
+            "Native adapters append --files to generic_cli_argv. Claude Code consumes "
+            "claude_hook_argv. Launch fields remain null until every requested profile passes. "
+            "Project root and rules directory are pinned. Regenerate doctor output after "
+            "tools, project paths, or rules move or change."
+        ),
+    }
+
+
+def doctor_readiness(
+    profiles: dict[str, dict[str, Any]], checks: list[DoctorCheck]
+) -> tuple[bool, tuple[str, ...]]:
+    validated_profiles = tuple(
+        name for name, result in profiles.items() if result["status"] == "pass"
+    )
+    ready = len(validated_profiles) == len(profiles) and all(
         check.status != "fail" for check in checks
     )
+    return ready, validated_profiles
+
+
+def build_doctor_report(
+    root: Path,
+    rules_dir: Path,
+    require_tools: bool,
+    profile: str = "all",
+    raw_probe_directory: str | None = None,
+) -> dict[str, Any]:
+    rules_dir = rules_dir.expanduser().resolve()
+    checks, runtime_check = doctor_environment_checks(root)
+    probe_directory, probe_directory_check = requested_doctor_probe_directory(
+        root, raw_probe_directory
+    )
+    if probe_directory_check:
+        checks.append(probe_directory_check)
+    rules, loaded_rules, rules_check = doctor_rules_check(rules_dir)
+    checks.append(rules_check)
+    detectors = detector_inventory(root, include_install=True)
+    selected_profiles = selected_doctor_profiles(profile)
+    required_detectors = required_profile_detectors(selected_profiles)
+    install_plan = detector_install_plan(detectors, required_detectors, selected_profiles)
+    for detector in REQUIRED_DETECTORS:
+        detectors[detector]["install"] = detector_install_info_for_profiles(
+            detector, selected_profiles
+        )
+    checks.extend(
+        doctor_detector_checks(
+            detectors, required_detectors, selected_profiles, require_tools
+        )
+    )
+    profiles, profile_checks = doctor_profile_checks(
+        selected_profiles,
+        rules,
+        rules_check.status == "pass",
+        runtime_check.status == "pass",
+        root,
+        probe_directory,
+        probe_directory_check is None or probe_directory_check.status == "pass",
+        detectors,
+        require_tools,
+    )
+    checks.extend(profile_checks)
+    strict_ready, validated_profiles = doctor_readiness(profiles, checks)
     status = doctor_status(checks)
     return {
         "schema_version": DOCTOR_SCHEMA_VERSION,
         "status": status,
         "strict_ready": strict_ready,
+        "selected_profiles": list(selected_profiles),
+        "profiles": profiles,
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "root": root.as_posix(),
+        "requested_probe_directory": (
+            probe_directory.as_posix() if probe_directory is not None else None
+        ),
         "rules_loaded": loaded_rules,
         "detectors": detectors,
-        "tool_catalog": [detector_install_info(detector) for detector in REQUIRED_DETECTORS],
+        "tool_catalog": [
+            detector_install_info_for_profiles(detector, selected_profiles)
+            for detector in REQUIRED_DETECTORS
+        ],
         "install_plan": install_plan,
         "quick_install_commands": quick_install_commands(install_plan),
+        "adapter_launch": adapter_launch_contract(
+            detectors,
+            selected_profiles,
+            validated_profiles,
+            strict_ready,
+            root,
+            rules_dir,
+        ),
         "adapter_targets": ADAPTER_TARGETS,
         "checks": [dataclasses.asdict(check) for check in checks],
         "next_steps": doctor_next_steps(status, strict_ready),
@@ -776,31 +1560,58 @@ def render_doctor_text(report: dict[str, Any]) -> str:
         lines.append(f"- {check['status']}: {check['id']}: {check['message']}")
         if check.get("remediation"):
             lines.append(f"  remediation: {check['remediation']}")
-    if report.get("install_plan"):
-        lines.append("Install missing detector tools:")
-        for item in report["install_plan"]:
-            lines.append(f"- {item['tool']}: {item['description']} {item['purpose']}")
-            lines.append(f"  install: {item['install_command']}")
-            lines.append(f"  verify: {item['verify_command']}")
-        if report.get("quick_install_commands"):
-            lines.append("Quick install commands:")
-            for command in report["quick_install_commands"]:
-                lines.append(f"- {command}")
-        lines.append(
-            "Safety: use PyPI/npm or approved internal mirrors. Do not use curl | sh installers."
-        )
-        lines.append(
-            "Manual commands only: adapters must not run them without explicit user approval."
-        )
-        lines.append("After installing: Rerun --doctor --require-tools.")
+    lines.extend(render_doctor_install_plan(report))
+    lines.extend(render_adapter_launch(report["adapter_launch"]))
     lines.append("Next steps:")
     for step in report["next_steps"]:
         lines.append(f"- {step}")
     return "\n".join(lines)
 
 
+def render_doctor_install_plan(report: dict[str, Any]) -> list[str]:
+    if not report.get("install_plan"):
+        return []
+    lines = ["Install missing detector tools:"]
+    for item in report["install_plan"]:
+        lines.append(f"- {item['tool']}: {item['description']} {item['purpose']}")
+        lines.append(f"  install: {item['install_command']}")
+        if item.get("config_requirement"):
+            lines.append(f"  configure: {item['config_requirement']}")
+        lines.append(f"  verify: {item['verify_command']}")
+        if item.get("documentation"):
+            lines.append(f"  docs: {item['documentation']}")
+        lines.append(f"  safety: {item['security_note']}")
+    if report.get("quick_install_commands"):
+        lines.append("Quick install commands:")
+        lines.extend(f"- {command}" for command in report["quick_install_commands"])
+    lines.extend(
+        [
+            "Safety: use PyPI/npm or approved internal mirrors. Do not use curl | sh installers.",
+            "Manual commands only: adapters must not run them without explicit user approval.",
+            "After installing: Rerun --doctor --require-tools.",
+        ]
+    )
+    return lines
+
+
+def render_adapter_launch(launch: dict[str, Any]) -> list[str]:
+    if not launch["ready"]:
+        return ["Adapter launch is not ready; resolve failed doctor checks first."]
+    return [
+        "Reproducible Claude Code POSIX launch:",
+        f"- {launch['claude_posix_command']}",
+        "Native adapters should append --files to adapter_launch.generic_cli_argv.",
+    ]
+
+
 def run_doctor(args: argparse.Namespace, root: Path) -> int:
-    report = build_doctor_report(root, Path(args.rules_dir), args.require_tools)
+    report = build_doctor_report(
+        root,
+        Path(args.rules_dir),
+        args.require_tools,
+        args.profile,
+        args.probe_dir,
+    )
     if args.format == "json":
         print(json.dumps(report, ensure_ascii=False, indent=JSON_INDENT))
     else:
@@ -875,6 +1686,24 @@ def resolve_scan_files(raw_paths: list[str], root: Path) -> tuple[list[Path], li
 def normalize_scan_files(raw_paths: list[str], root: Path) -> list[Path]:
     files, _ = resolve_scan_files(raw_paths, root)
     return files
+
+
+def enforce_scan_profile(
+    files: list[Path], profile: str, root: Path
+) -> tuple[list[Path], list[SkippedFile], list[ToolError]]:
+    if profile == "all":
+        return files, [], []
+    allowed_extensions = set(DOCTOR_PROFILE_EXTENSIONS[profile])
+    in_scope = [path for path in files if path.suffix in allowed_extensions]
+    outside_profile = [path for path in files if path.suffix not in allowed_extensions]
+    if not outside_profile:
+        return in_scope, [], []
+    names = [relative_path(path, root) for path in outside_profile]
+    skipped = [SkippedFile(path=name, reason="outside_scan_profile") for name in names]
+    errors = [
+        ToolError("profile-scope", f"Scan profile {profile} does not certify: {', '.join(names)}.")
+    ]
+    return in_scope, skipped, errors
 
 
 def relative_path(path: Path, root: Path) -> str:
@@ -1427,7 +2256,7 @@ def run_ruff(
     outcome_files = tuple(relative_path(path, root) for path in python_files)
     if not python_files:
         return [], [], DetectorOutcome("not_applicable", "none", ())
-    ruff = shutil.which("ruff")
+    ruff = find_detector("ruff", root)
     if not ruff:
         message = "Ruff is required for Python PLR2004 magic-value checks."
         return [], [ToolError("ruff", message)], DetectorOutcome(
@@ -1527,12 +2356,24 @@ def eslint_magic_line_error(payload: list[Any]) -> str | None:
 
 
 def eslint_exit_consistency_error(payload: list[Any], returncode: int) -> str | None:
-    has_messages = any(True for _ in iter_eslint_messages(payload))
-    if returncode == 1 and not has_messages:
+    messages = list(iter_eslint_messages(payload))
+    has_gate_diagnostics = any(
+        message.get("ruleId") == "no-magic-numbers" for message in messages
+    )
+    if returncode == 1 and not messages:
         return "ESLint exited 1 but produced no diagnostics."
-    if returncode == 0 and has_messages:
-        return "ESLint exited 0 but produced diagnostics."
+    if returncode == 0 and has_gate_diagnostics:
+        return "ESLint exited 0 but produced no-magic-numbers diagnostics."
     return None
+
+
+def eslint_option_unsupported(message: str, option: str) -> bool:
+    normalized_message = message.lower()
+    option_key = option.removeprefix("--").removeprefix("no-")
+    markers = ("invalid option", "unknown option", "unrecognized option")
+    return option_key in normalized_message and any(
+        marker in normalized_message for marker in markers
+    )
 
 
 def eslint_coverage_diagnostic(
@@ -1566,6 +2407,33 @@ def eslint_coverage_diagnostic(
     return status, "; ".join(messages)
 
 
+def eslint_command_variants(
+    eslint_prefix: list[str], rule_config: str, files: list[Path]
+) -> list[list[str]]:
+    base_command = [*eslint_prefix, "--rule", rule_config, "--format", "json"]
+    file_arguments = [str(path) for path in files]
+    if any(path.suffix in TYPESCRIPT_EXTENSIONS for path in files):
+        return [[*base_command, *file_arguments]]
+    parser_options = json.dumps(
+        {"ecmaFeatures": {"jsx": True}, "sourceType": "module"}
+    )
+    extension_arguments = [
+        item
+        for extension in sorted({path.suffix for path in files})
+        for item in ("--ext", extension)
+    ]
+    configured_command = [
+        *base_command,
+        "--parser-options",
+        parser_options,
+        *extension_arguments,
+    ]
+    return [
+        [*configured_command, "--no-config-lookup", *file_arguments],
+        [*configured_command, "--no-eslintrc", *file_arguments],
+    ]
+
+
 def run_eslint(
     files: list[Path], root: Path, _require_tools: bool
 ) -> tuple[list[Issue], list[ToolError], DetectorOutcome]:
@@ -1573,7 +2441,7 @@ def run_eslint(
     outcome_files = tuple(relative_path(path, root) for path in js_files)
     if not js_files:
         return [], [], DetectorOutcome("not_applicable", "none", ())
-    eslint = shutil.which("eslint")
+    eslint = find_detector("eslint", root)
     if not eslint:
         message = "ESLint is required for JS/TS no-magic-numbers checks."
         return [], [ToolError("eslint", message)], DetectorOutcome(
@@ -1592,11 +2460,9 @@ def run_eslint(
             ]
         }
     )
-    base_command = [eslint, "--rule", rule_config, "--format", "json"]
-    command_variants = [
-        [*base_command, "--no-config-lookup", *[str(path) for path in js_files]],
-        [*base_command, "--no-eslintrc", *[str(path) for path in js_files]],
-    ]
+    command_variants = eslint_command_variants(
+        eslint_command_prefix(eslint), rule_config, js_files
+    )
 
     last_error = ""
     failure_status = "failed"
@@ -1605,35 +2471,39 @@ def run_eslint(
         if timeout_error:
             failure_status = "failed"
             last_error = timeout_error.message
-            continue
+            break
         assert result is not None
         if result.returncode not in {0, 1}:
             failure_status = "failed"
             last_error = result.stderr.strip() or "ESLint failed."
-            continue
+            if "--no-config-lookup" in command and eslint_option_unsupported(
+                last_error, "--no-config-lookup"
+            ):
+                continue
+            break
         if result.stdout.strip():
             try:
                 payload = json.loads(result.stdout)
             except json.JSONDecodeError:
                 failure_status = "failed"
                 last_error = "ESLint produced non-JSON output."
-                continue
+                break
             if not isinstance(payload, list):
                 failure_status = "failed"
                 last_error = "ESLint JSON output must be an array."
-                continue
+                break
             diagnostic_status, diagnostic_message = eslint_coverage_diagnostic(
                 payload, js_files, root
             )
             if diagnostic_status is not None:
                 failure_status = diagnostic_status
                 last_error = diagnostic_message or "ESLint did not lint every requested file."
-                continue
+                break
             consistency_error = eslint_exit_consistency_error(payload, result.returncode)
             if consistency_error:
                 failure_status = "failed"
                 last_error = consistency_error
-                continue
+                break
             return (
                 parse_eslint_payload(payload, root),
                 [],
@@ -1641,6 +2511,7 @@ def run_eslint(
             )
         failure_status = "failed"
         last_error = result.stderr.strip()
+        break
     message = last_error or "ESLint failed without JSON output."
     return [], [ToolError("eslint", message)], DetectorOutcome(
         failure_status, "none", outcome_files, message=message
@@ -1819,7 +2690,7 @@ def run_lizard(
     outcome_files = tuple(relative_path(path, root) for path in files)
     if not files:
         return [], [], DetectorOutcome("not_applicable", "none", ())
-    lizard = shutil.which("lizard")
+    lizard = find_detector("lizard", root)
     if not lizard:
         message = "lizard is required for function complexity checks."
         return [], [ToolError("lizard", message)], DetectorOutcome(
@@ -2209,13 +3080,19 @@ def main(argv: list[str]) -> int:
     except RuleValidationError as exc:
         rule_errors.append(ToolError("rule-config", str(exc)))
     policy, policy_errors = effective_policy(request, rules)
+    policy["scan_profile"] = args.scan_profile
     rule_errors.extend(policy_errors)
 
     files, skipped_files = resolve_scan_files(list(request.files), root)
+    files, profile_skipped, profile_errors = enforce_scan_profile(
+        files, args.scan_profile, root
+    )
+    skipped_files.extend(profile_skipped)
+    input_errors.extend(profile_errors)
 
     metrics = collect_quality_metrics(files, root)
     ratchet, ratchet_errors = evaluate_ratchet(metrics, request.baseline_path)
-    detectors = detector_inventory()
+    detectors = detector_inventory(root)
     issues, tool_errors, detector_outcomes = scan_files(
         files, root, policy["complexity_threshold"], request.strict
     )

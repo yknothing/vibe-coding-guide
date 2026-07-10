@@ -18,7 +18,8 @@ Check local readiness before enabling strict hook mode:
 
 ```bash
 python3 hooks/post_tool_use_quality_gate.py --doctor
-python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile python --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile all --require-tools
 python3 hooks/post_tool_use_quality_gate.py --doctor --format json
 ```
 
@@ -26,9 +27,22 @@ python3 hooks/post_tool_use_quality_gate.py --doctor --format json
 external detectors are missing because fallback detectors can still run. Strict
 mode treats a missing applicable `ruff`, `eslint`, or `lizard` as `fail`; do not enable
 `--require-tools` in an adapter until doctor reports `strict_ready: true`.
-Doctor checks the complete installation inventory. A file scan is profile-scoped:
-strict mode requires only detectors applicable to the scanned file types, so a
-Python-only scan does not require ESLint.
+Doctor defaults to `--profile all`; `python`, `javascript`, and `typescript` can be
+checked independently. It requires Python 3.11+, the complete core rule set, and two
+automatically deleted probes per profile: a clean file must pass, while a known-bad
+canary must block on both `IMP_004` and `IMP_007` with detector evidence. A version
+string alone is not readiness evidence. TypeScript readiness requires a working ESLint
+parser/config, not only an `eslint` executable. Doctor does not install or download
+dependencies, but detector processes and project config are not network-sandboxed.
+The JavaScript probe covers `.js/.jsx/.mjs/.cjs`; TypeScript covers `.ts/.tsx`.
+Run doctor with each package as `--root` in a monorepo; one probe directory is not
+evidence for every package. A file scan is also profile-scoped.
+For scoped TypeScript config, pass an explicitly covered directory, for example:
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile typescript \
+  --probe-dir src --require-tools
+```
 
 ## Claude Code Setup
 
@@ -40,23 +54,38 @@ Install the detector tools first. `--doctor` reports the same information in
 | `ruff` | Fast Python linter | Detects Python magic numeric literals through Ruff `PLR2004`. |
 | `lizard` | Cyclomatic complexity analyzer | Measures function complexity for `IMP_007`. |
 | `eslint` | JavaScript and TypeScript linter | Detects JavaScript magic numeric literals; TypeScript also needs a working parser/config. |
+| `typescript-eslint` | Project-local TypeScript tooling | Supplies the TypeScript parser and flat config support. |
 
 ```bash
 python3 -m pip install --upgrade ruff lizard
+# JavaScript-only standalone path
 npm install -g eslint
+# TypeScript project path
+npm install --save-dev eslint @eslint/js typescript typescript-eslint
 ```
 
 These commands are for manual confirmation only; adapters and installers must
 not run them without explicit user approval. Use PyPI/npm, approved internal
 mirrors, or a pinned/approved toolchain. Do not use `curl | sh` installers.
+Install Python CLI tools in a dedicated virtual environment, `pipx`, or an approved
+tool environment rather than modifying system Python.
 If global npm installs are blocked, or the target environment is not a
 macOS/Linux shell, install ESLint in the project or approved tool environment
-with an equivalent command and make sure the hook process can find `eslint` on
-`PATH`.
+with an equivalent command. Only ESLint may be resolved from the project: the core prefers
+`<project-root>/node_modules/.bin/eslint` and then falls back to `PATH`; Ruff and lizard
+must come from the hook environment. TypeScript projects must also provide
+an `eslint.config.*` that includes `.ts`/`.tsx` files; doctor verifies it by
+linting a temporary project-local TypeScript fixture. ESLint config files are
+executable code, so run doctor or strict scans only in a trusted repository whose
+configuration has been reviewed.
+TypeScript probes use the directory of an existing `.ts/.tsx` file when available so
+scoped config can match. The temporary files exist while detectors run; avoid running
+doctor concurrently with sensitive watchers, and check for `vcg-doctor-*` residue after
+an uncatchable process termination.
 Verify the setup before enabling the hook:
 
 ```bash
-python3 hooks/post_tool_use_quality_gate.py --doctor --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile all --require-tools
 ```
 
 Then add this project-scoped hook to `.claude/settings.json`:
@@ -79,6 +108,17 @@ Then add this project-scoped hook to `.claude/settings.json`:
   }
 }
 ```
+
+The snippet is portable documentation, not a pinned runtime. For a reproducible
+installation, native adapters append `--files` to `adapter_launch.generic_cli_argv`;
+Claude Code uses `adapter_launch.claude_hook_argv`. Both consume
+`adapter_launch.environment` from a passing doctor report. The text doctor prints
+`adapter_launch.claude_posix_command`. It pins ESLint's Node runtime with
+`VCG_NODE_BIN`, pins the validated project root and rules directory, and adds
+`--scan-profile` so the hook cannot scan outside the profiles
+that doctor certified before out-of-scope detectors can run. Failed doctor reports set
+`adapter_launch.ready: false` and leave executable launch fields null. Regenerate after
+moving or upgrading tools, rules, or the project.
 
 `--require-tools` is intentional: an applicable detector that is missing or fails
 is treated as a setup failure instead of a green pass. The script still has

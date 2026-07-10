@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -17,6 +18,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "hooks" / "post_tool_use_quality_gate.py"
 RULES_DIR = ROOT / "rules"
+MISSING_DETECTOR_ENV = {
+    "PATH": "/nonexistent",
+    "VCG_RUFF_BIN": "/nonexistent/ruff",
+    "VCG_ESLINT_BIN": "/nonexistent/eslint",
+    "VCG_LIZARD_BIN": "/nonexistent/lizard",
+}
 
 
 def make_executable(path: Path, content: str) -> None:
@@ -40,6 +47,103 @@ def lizard_script(files: list[Path], csv_output: str = "") -> str:
         "else\n"
         f"  {csv_command}"
         "fi\n"
+    )
+
+
+def doctor_lizard_script(emit_canary: bool = True) -> str:
+    canary_row = (
+        '        if "canary" in Path(path).name:\n'
+        '            print(f"20,12,40,1,20,1:1,{path},classify")\n'
+        if emit_canary
+        else "        pass\n"
+    )
+    return (
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from xml.sax.saxutils import escape\n\n"
+        'if "--version" in sys.argv:\n'
+        '    print("1.23.0")\n'
+        "    raise SystemExit(0)\n"
+        'extensions = {".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}\n'
+        "files = [arg for arg in sys.argv[1:] if Path(arg).suffix in extensions]\n"
+        'if "--csv" in sys.argv:\n'
+        '    print("NLOC,CCN,token,PARAM,length,location,file,function")\n'
+        "    for path in files:\n"
+        f"{canary_row}"
+        "    raise SystemExit(0)\n"
+        'items = "".join(f\'<item name="{escape(path)}" />\' for path in files)\n'
+        "print(f'<cppncss><measure type=\"Function\" /><measure type=\"File\">"
+        "{items}</measure></cppncss>')\n"
+    )
+
+
+def doctor_empty_lizard_script() -> str:
+    return doctor_lizard_script(emit_canary=False)
+
+
+def doctor_ruff_script() -> str:
+    return textwrap.dedent(
+        f"""\
+        #!{sys.executable}
+        import json
+        import sys
+        from pathlib import Path
+
+        if "--version" in sys.argv:
+            print("ruff 0.15.7")
+            raise SystemExit(0)
+        files = [arg for arg in sys.argv[1:] if Path(arg).suffix == ".py"]
+        diagnostics = [
+            {{
+                "code": "PLR2004",
+                "filename": path,
+                "location": {{"row": 2}},
+                "message": "canary magic",
+            }}
+            for path in files
+            if "canary" in Path(path).name
+        ]
+        print(json.dumps(diagnostics))
+        raise SystemExit(1 if diagnostics else 0)
+        """
+    )
+
+
+def doctor_eslint_script(
+    reject_disabled_config: bool = False, allowed_root: Path | None = None
+) -> str:
+    return textwrap.dedent(
+        f"""\
+        #!{sys.executable}
+        import json
+        import sys
+        from pathlib import Path
+
+        if "--version" in sys.argv:
+            print("v10.6.0")
+            raise SystemExit(0)
+        extensions = {{".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}}
+        files = [arg for arg in sys.argv[1:] if Path(arg).suffix in extensions]
+        allowed_root = {str(allowed_root.resolve()) if allowed_root else None!r}
+        config_disabled = {reject_disabled_config!r} and any(
+            option in sys.argv for option in ("--no-config-lookup", "--no-eslintrc")
+        )
+        payload = []
+        for path in files:
+            messages = []
+            if allowed_root and not Path(path).is_relative_to(Path(allowed_root)):
+                messages.append({{"ruleId": None, "message": "File ignored by scoped config."}})
+            elif config_disabled:
+                messages.append({{"ruleId": None, "message": "TypeScript config lookup was disabled."}})
+            elif "canary" in Path(path).name:
+                messages.append(
+                    {{"ruleId": "no-magic-numbers", "line": 2, "message": "canary magic"}}
+                )
+            payload.append({{"filePath": path, "messages": messages}})
+        print(json.dumps(payload))
+        raise SystemExit(1 if any(item["messages"] and item["messages"][0].get("ruleId") for item in payload) else 0)
+        """
     )
 
 
@@ -1114,7 +1218,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 workspace,
                 payload,
                 "--require-tools",
-                env={"PATH": "/nonexistent"},
+                env=MISSING_DETECTOR_ENV,
             )
 
             self.assertEqual(result.returncode, 2, result.stderr)
@@ -1290,13 +1394,13 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             )
             self.assertIn("ignored", eslint_error)
 
-    def test_eslint_reports_the_latest_variant_failure(self) -> None:
+    def test_eslint_does_not_mask_modern_variant_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
-            target = workspace / "typed.ts"
-            target.write_text("export const label: string = 'ok';\n", encoding="utf-8")
+            target = workspace / "clean.js"
+            target.write_text("export const label = 'ok';\n", encoding="utf-8")
             ignored_payload = json.dumps(
                 [
                     {
@@ -1330,8 +1434,38 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
             report = json.loads(result.stdout)
             eslint_run = report["detectors"]["eslint"]["run"]
-            self.assertEqual(eslint_run["status"], "failed")
-            self.assertIn("second variant failed", eslint_run["message"])
+            self.assertEqual(eslint_run["status"], "ignored")
+            self.assertIn("ignored by the first variant", eslint_run["message"])
+
+    def test_eslint_falls_back_when_modern_option_is_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.js"
+            target.write_text("export const label = 'ok';\n", encoding="utf-8")
+            clean_payload = json.dumps([{"filePath": str(target), "messages": []}])
+            make_executable(
+                bin_dir / "eslint",
+                "#!/bin/sh\n"
+                'case " $* " in\n'
+                "  *' --no-config-lookup '*) printf '%s\\n' "
+                "\"Invalid option '--no-config-lookup'\" >&2; exit 2 ;;\n"
+                f"  *) printf '%s\\n' '{clean_payload}' ;;\n"
+                "esac\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "succeeded")
 
     def test_eslint_runs_from_explicit_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1696,6 +1830,46 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(report["status"], "error")
             self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
 
+    def test_eslint_ignores_unrelated_project_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.ts"
+            target.write_text("export const label: string = 'ok';\n", encoding="utf-8")
+            warning_payload = json.dumps(
+                [
+                    {
+                        "filePath": str(target),
+                        "messages": [
+                            {
+                                "ruleId": "@typescript-eslint/no-unused-vars",
+                                "severity": 1,
+                                "line": 1,
+                                "message": "Unrelated project warning.",
+                            }
+                        ],
+                    }
+                ]
+            )
+            make_executable(
+                bin_dir / "eslint",
+                f"#!/bin/sh\nprintf '%s\\n' '{warning_payload}'\n",
+            )
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--require-tools",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "succeeded")
+            self.assertEqual(report["issues"], [])
+
     def test_eslint_embedded_null_file_path_is_structured_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -1946,7 +2120,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                     str(workspace),
                 ],
                 cwd=workspace,
-                env={**os.environ, "PATH": "/nonexistent"},
+                env={**os.environ, **MISSING_DETECTOR_ENV},
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1961,6 +2135,637 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertIn("detector.ruff", failed_checks)
             self.assertIn("detector.eslint", failed_checks)
             self.assertIn("detector.lizard", failed_checks)
+
+    def test_doctor_python_profile_probes_only_python_detectors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            rules_dir = workspace / "rules"
+            bin_dir.mkdir()
+            shutil.copytree(RULES_DIR, rules_dir)
+            make_executable(bin_dir / "ruff", doctor_ruff_script())
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                    "--rules-dir",
+                    str(rules_dir),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["strict_ready"])
+            self.assertEqual(report["selected_profiles"], ["python"])
+            profile = report["profiles"]["python"]
+            self.assertEqual(profile["status"], "pass")
+            self.assertEqual(profile["probes"]["clean"]["decision"]["outcome"], "pass")
+            self.assertEqual(profile["probes"]["canary"]["decision"]["outcome"], "block")
+            self.assertEqual(
+                set(profile["probes"]["canary"]["decision"]["rule_ids"]["block"]),
+                {"IMP_004", "IMP_007"},
+            )
+            self.assertEqual(
+                set(profile["probes"]["canary"]["detector_evidence"]),
+                {"ruff", "lizard"},
+            )
+            for evidence in profile["probes"]["canary"]["evidence_by_file"].values():
+                self.assertEqual(set(evidence["rule_ids"]), {"IMP_004", "IMP_007"})
+                self.assertEqual(set(evidence["detectors"]), {"ruff", "lizard"})
+            launch = report["adapter_launch"]
+            self.assertTrue(launch["ready"])
+            self.assertEqual(launch["core_argv"][0], str(Path(sys.executable).resolve()))
+            self.assertEqual(launch["core_argv"][1], str(HOOK.resolve()))
+            self.assertEqual(
+                launch["environment"]["VCG_RUFF_BIN"],
+                str((bin_dir / "ruff").resolve()),
+            )
+            self.assertIn("VCG_LIZARD_BIN=", launch["claude_posix_command"])
+            self.assertEqual(launch["validated_profiles"], ["python"])
+            self.assertEqual(launch["project_root"], str(workspace.resolve()))
+            self.assertEqual(launch["rules_dir"], str(rules_dir.resolve()))
+            self.assertNotIn(
+                "detector.eslint",
+                {check["id"] for check in report["checks"]},
+            )
+
+            clean_file = workspace / "clean.py"
+            clean_file.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            launch_dir = workspace / "unrelated-launch-directory"
+            launch_dir.mkdir()
+            scan = subprocess.run(
+                [*launch["generic_cli_argv"], "--files", str(clean_file)],
+                cwd=launch_dir,
+                env={**os.environ, "PATH": str(bin_dir), **launch["environment"]},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(scan.returncode, 0, scan.stdout or scan.stderr)
+            scan_report = json.loads(scan.stdout)
+            self.assertEqual(scan_report["root"], str(workspace.resolve()))
+            self.assertEqual(scan_report["scanned_files"], ["clean.py"])
+
+    def test_doctor_rejects_non_discriminating_detector_smoke(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            make_executable(
+                bin_dir / "ruff",
+                "#!/bin/sh\n"
+                'if [ "$1" = "--version" ]; then printf \'ruff 0.15.7\\n\'; '
+                "else printf '[]\\n'; fi\n",
+            )
+            make_executable(bin_dir / "lizard", doctor_empty_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            profile = json.loads(result.stdout)["profiles"]["python"]
+            self.assertEqual(profile["status"], "fail")
+            self.assertEqual(profile["reason"], "probe_expectation_failed")
+            self.assertNotEqual(
+                set(profile["probes"]["canary"]["detector_evidence"]),
+                {"ruff", "lizard"},
+            )
+
+    def test_doctor_javascript_profile_probes_only_javascript_detectors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            make_executable(
+                bin_dir / "node",
+                "#!/bin/sh\nexec \"$@\"\n",
+            )
+            make_executable(bin_dir / "eslint", doctor_eslint_script())
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "javascript",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["strict_ready"])
+            self.assertEqual(report["selected_profiles"], ["javascript"])
+            profile = report["profiles"]["javascript"]
+            self.assertEqual(profile["status"], "pass")
+            self.assertEqual(profile["probes"]["clean"]["decision"]["outcome"], "pass")
+            self.assertEqual(profile["probes"]["canary"]["decision"]["outcome"], "block")
+            self.assertEqual(
+                set(profile["probes"]["canary"]["detector_evidence"]),
+                {"eslint", "lizard"},
+            )
+            self.assertEqual(
+                {Path(path).suffix for path in profile["probes"]["clean"]["scanned_files"]},
+                {".js", ".jsx", ".mjs", ".cjs"},
+            )
+            self.assertEqual(
+                report["adapter_launch"]["environment"]["VCG_NODE_BIN"],
+                str((bin_dir / "node").resolve()),
+            )
+            self.assertEqual(report["adapter_launch"]["scan_profile"], "javascript")
+            self.assertEqual(
+                report["adapter_launch"]["generic_cli_argv"][-2:],
+                ["--scan-profile", "javascript"],
+            )
+            for evidence in profile["probes"]["canary"]["evidence_by_file"].values():
+                self.assertEqual(set(evidence["rule_ids"]), {"IMP_004", "IMP_007"})
+                self.assertEqual(set(evidence["detectors"]), {"eslint", "lizard"})
+
+            first_evidence = next(
+                iter(profile["probes"]["canary"]["evidence_by_file"].values())
+            )
+            first_evidence["detectors"] = ["eslint"]
+            module = load_hook_module()
+            self.assertFalse(
+                module.doctor_profile_probes_passed(
+                    profile["probes"],
+                    ("eslint", "lizard"),
+                )
+            )
+            self.assertNotIn(
+                "detector.ruff",
+                {check["id"] for check in report["checks"]},
+            )
+
+    def test_doctor_finds_project_local_eslint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            local_bin = workspace / "node_modules" / ".bin"
+            bin_dir.mkdir()
+            local_bin.mkdir(parents=True)
+            make_executable(local_bin / "eslint", doctor_eslint_script())
+            make_executable(
+                bin_dir / "eslint",
+                "#!/bin/sh\n"
+                'if [ "$1" = "--version" ]; then printf \'v0.0.0-global\\n\'; exit 0; fi\n'
+                "printf 'global eslint must not run\\n' >&2\n"
+                "exit 2\n",
+            )
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "javascript",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["strict_ready"])
+            self.assertEqual(
+                report["detectors"]["eslint"]["path"],
+                str((local_bin / "eslint").resolve()),
+            )
+
+    def test_doctor_does_not_execute_project_local_ruff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            local_bin = workspace / "node_modules" / ".bin"
+            bin_dir.mkdir()
+            local_bin.mkdir(parents=True)
+            make_executable(bin_dir / "ruff", doctor_ruff_script())
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+            make_executable(
+                local_bin / "ruff",
+                "#!/bin/sh\nprintf 'project-local ruff must not run\\n' >&2\nexit 2\n",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(
+                report["detectors"]["ruff"]["path"],
+                str((bin_dir / "ruff").resolve()),
+            )
+
+    def test_scan_profile_fails_closed_outside_certified_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.js"
+            target.write_text("const LABEL = 'ok';\n", encoding="utf-8")
+            make_executable(bin_dir / "eslint", doctor_eslint_script())
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--scan-profile",
+                "python",
+                env={"PATH": str(bin_dir)},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertEqual(report["policy"]["scan_profile"], "python")
+            self.assertIn("profile-scope", {error["tool"] for error in report["tool_errors"]})
+            self.assertEqual(report["scanned_files"], [])
+            self.assertEqual(report["skipped_files"][0]["reason"], "outside_scan_profile")
+            self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "not_applicable")
+            self.assertEqual(report["detectors"]["lizard"]["run"]["status"], "not_applicable")
+
+    def test_windows_eslint_prefix_pins_node_and_javascript_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            local_bin = workspace / "node_modules" / ".bin"
+            eslint_entrypoint = workspace / "node_modules" / "eslint" / "bin" / "eslint.js"
+            node = workspace / "node.exe"
+            local_bin.mkdir(parents=True)
+            eslint_entrypoint.parent.mkdir(parents=True)
+            (local_bin / "eslint.cmd").write_text("@echo off\n", encoding="utf-8")
+            eslint_entrypoint.write_text("// eslint entrypoint\n", encoding="utf-8")
+            node.write_bytes(b"node")
+            node.chmod(0o755)
+
+            module = load_hook_module()
+            with mock.patch.dict(os.environ, {"VCG_NODE_BIN": str(node)}):
+                prefix = module.eslint_command_prefix(
+                    str(local_bin / "eslint.cmd"), platform_name="nt"
+                )
+
+            self.assertEqual(prefix, [str(node.resolve()), str(eslint_entrypoint.resolve())])
+
+    def test_doctor_all_profiles_require_discriminating_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            make_executable(bin_dir / "ruff", doctor_ruff_script())
+            make_executable(bin_dir / "eslint", doctor_eslint_script())
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "all",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["strict_ready"])
+            self.assertEqual(report["selected_profiles"], ["python", "javascript", "typescript"])
+            self.assertEqual(
+                {name: profile["status"] for name, profile in report["profiles"].items()},
+                {"python": "pass", "javascript": "pass", "typescript": "pass"},
+            )
+
+    def test_doctor_typescript_profile_fails_on_ignored_parser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            make_executable(
+                bin_dir / "eslint",
+                "#!/bin/sh\n"
+                'if [ "$1" = "--version" ]; then printf \'v10.6.0\\n\'; exit 0; fi\n'
+                'last=""; for arg in "$@"; do last="$arg"; done\n'
+                "printf '[{\"filePath\":\"%s\",\"messages\":[{\"ruleId\":null,"
+                "\"message\":\"File ignored because no matching configuration was supplied.\"}]}]\\n' "
+                '"$last"\n',
+            )
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "typescript",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertFalse(report["strict_ready"])
+            profile = report["profiles"]["typescript"]
+            self.assertEqual(profile["status"], "fail")
+            self.assertIn("parser", profile["remediation"].lower())
+            self.assertEqual(
+                profile["setup"]["install_command"],
+                "npm install --save-dev eslint @eslint/js typescript typescript-eslint",
+            )
+            self.assertEqual(profile["setup"]["verify_command"], "npx eslint path/to/file.ts")
+            self.assertIn("Do not install silently", profile["remediation"])
+            launch = report["adapter_launch"]
+            self.assertFalse(launch["ready"])
+            self.assertEqual(launch["validated_profiles"], [])
+            self.assertIsNone(launch["generic_cli_argv"])
+            self.assertIsNone(launch["claude_hook_argv"])
+
+    def test_doctor_typescript_profile_uses_project_eslint_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            source_dir = workspace / "src"
+            bin_dir = workspace / "bin"
+            source_dir.mkdir()
+            bin_dir.mkdir()
+            (source_dir / "existing.ts").write_text(
+                "export const existing: string = 'ok';\n",
+                encoding="utf-8",
+            )
+            make_executable(
+                bin_dir / "eslint",
+                doctor_eslint_script(reject_disabled_config=True),
+            )
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "typescript",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["strict_ready"])
+            profile = report["profiles"]["typescript"]
+            self.assertEqual(profile["status"], "pass")
+            self.assertEqual(profile["probe_directory"], "src")
+            self.assertEqual(profile["probes"]["clean"]["decision"]["outcome"], "pass")
+            self.assertEqual(profile["probes"]["canary"]["decision"]["outcome"], "block")
+            self.assertEqual(
+                {Path(path).suffix for path in profile["probes"]["clean"]["scanned_files"]},
+                {".ts", ".tsx"},
+            )
+            for evidence in profile["probes"]["canary"]["evidence_by_file"].values():
+                self.assertEqual(set(evidence["rule_ids"]), {"IMP_004", "IMP_007"})
+                self.assertEqual(set(evidence["detectors"]), {"eslint", "lizard"})
+            self.assertEqual(
+                list(workspace.glob("vcg-doctor-typescript-*")),
+                [],
+                "doctor fixtures must be cleaned automatically",
+            )
+            self.assertEqual(list(source_dir.glob("vcg-doctor-typescript-*")), [])
+
+    def test_doctor_probe_dir_overrides_scoped_typescript_heuristic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            examples_dir = workspace / "examples"
+            source_dir = workspace / "src"
+            bin_dir = workspace / "bin"
+            examples_dir.mkdir()
+            source_dir.mkdir()
+            bin_dir.mkdir()
+            (examples_dir / "first.ts").write_text("export const first = 'ok';\n", encoding="utf-8")
+            (source_dir / "real.ts").write_text("export const real = 'ok';\n", encoding="utf-8")
+            make_executable(
+                bin_dir / "eslint",
+                doctor_eslint_script(allowed_root=source_dir),
+            )
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            module = load_hook_module()
+            self.assertEqual(
+                module.doctor_profile_probe_directory("typescript", workspace),
+                examples_dir.resolve(),
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "typescript",
+                    "--probe-dir",
+                    "src",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertTrue(report["strict_ready"])
+            self.assertEqual(report["profiles"]["typescript"]["probe_directory"], "src")
+
+    def test_doctor_rejects_probe_dir_outside_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "project"
+            workspace.mkdir()
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--probe-dir",
+                    "..",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            check = next(item for item in report["checks"] if item["id"] == "probe.directory")
+            self.assertEqual(check["status"], "fail")
+            self.assertFalse(check["detail"]["inside_root"])
+            self.assertEqual(report["profiles"]["python"]["probes"], {})
+
+    def test_python_runtime_check_rejects_pre_311(self) -> None:
+        module = load_hook_module()
+
+        check = module.python_runtime_check((3, 10, 14), "3.10.14")
+
+        self.assertEqual(check.status, "fail")
+        self.assertIn("3.11", check.remediation)
+
+    def test_doctor_canary_tracks_configured_complexity_threshold(self) -> None:
+        module = load_hook_module()
+
+        source = module.doctor_canary_source("python", 20)
+        function = ast.parse(source).body[0]
+
+        self.assertEqual(module.python_cyclomatic_complexity(function), 21)
+        self.assertEqual(source.count("if value =="), 20)
+
+    def test_doctor_fails_when_required_rule_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            rules_dir = workspace / "rules"
+            bin_dir.mkdir()
+            rules_dir.mkdir()
+            shutil.copy(RULES_DIR / "IMP_007.yml", rules_dir / "IMP_007.yml")
+            make_executable(bin_dir / "ruff", doctor_ruff_script())
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--rules-dir",
+                    str(rules_dir),
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertFalse(report["strict_ready"])
+            rules_check = next(check for check in report["checks"] if check["id"] == "rules.load")
+            self.assertEqual(rules_check["status"], "fail")
+            self.assertIn("IMP_004", rules_check["detail"]["missing_rules"])
+            self.assertEqual(report["profiles"]["python"]["probes"], {})
 
     def test_doctor_json_explains_missing_detector_install_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1978,7 +2783,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                     str(workspace),
                 ],
                 cwd=workspace,
-                env={**os.environ, "PATH": "/nonexistent"},
+                env={**os.environ, **MISSING_DETECTOR_ENV},
                 capture_output=True,
                 text=True,
                 check=False,
@@ -1992,7 +2797,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 report["quick_install_commands"],
                 [
                     "python3 -m pip install --upgrade ruff lizard",
-                    "npm install -g eslint",
+                    "npm install --save-dev eslint @eslint/js typescript typescript-eslint",
                 ],
             )
             for detector in ["ruff", "eslint", "lizard"]:
@@ -2009,7 +2814,16 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 "python3 -m pip install --upgrade lizard",
             )
             self.assertIn("cyclomatic complexity", install_plan["lizard"]["purpose"])
-            self.assertEqual(install_plan["eslint"]["install_command"], "npm install -g eslint")
+            self.assertEqual(
+                install_plan["eslint"]["install_command"],
+                "npm install --save-dev eslint @eslint/js typescript typescript-eslint",
+            )
+            self.assertIn("eslint.config", install_plan["eslint"]["config_requirement"])
+            self.assertEqual(
+                install_plan["eslint"]["documentation"],
+                "https://typescript-eslint.io/getting-started/",
+            )
+            self.assertIn("trusted project", install_plan["eslint"]["security_note"])
             self.assertIn("JavaScript", install_plan["eslint"]["description"])
 
     def test_doctor_text_explains_safe_detector_install_steps(self) -> None:
@@ -2026,7 +2840,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                     str(workspace),
                 ],
                 cwd=workspace,
-                env={**os.environ, "PATH": "/nonexistent"},
+                env={**os.environ, **MISSING_DETECTOR_ENV},
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2039,7 +2853,14 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertIn("lizard: Cyclomatic complexity analyzer", result.stderr)
             self.assertIn("python3 -m pip install --upgrade lizard", result.stderr)
             self.assertIn("eslint: JavaScript and TypeScript linter", result.stderr)
-            self.assertIn("npm install -g eslint", result.stderr)
+            self.assertIn(
+                "npm install --save-dev eslint @eslint/js typescript typescript-eslint",
+                result.stderr,
+            )
+            self.assertNotIn("npm install -g eslint", result.stderr)
+            self.assertIn("configure: Add eslint.config.mjs", result.stderr)
+            self.assertIn("docs: https://typescript-eslint.io/getting-started/", result.stderr)
+            self.assertIn("trusted project", result.stderr)
             self.assertIn("Do not use curl | sh", result.stderr)
             self.assertIn("Manual commands only", result.stderr)
             self.assertIn("Rerun --doctor --require-tools", result.stderr)
