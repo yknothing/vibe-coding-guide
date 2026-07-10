@@ -53,6 +53,7 @@ Install the detector tools first. `--doctor` reports the same information in
 |---|---|---|
 | `ruff` | Fast Python linter | Detects Python magic numeric literals through Ruff `PLR2004`. |
 | `lizard` | Cyclomatic complexity analyzer | Measures function complexity for `IMP_007`. |
+| `Node.js` | JavaScript runtime | Runs ESLint and is pinned through `VCG_NODE_BIN`. |
 | `eslint` | JavaScript and TypeScript linter | Detects JavaScript magic numeric literals; TypeScript also needs a working parser/config. |
 | `typescript-eslint` | Project-local TypeScript tooling | Supplies the TypeScript parser and flat config support. |
 
@@ -67,6 +68,8 @@ npm install --save-dev eslint @eslint/js typescript typescript-eslint
 These commands are for manual confirmation only; adapters and installers must
 not run them without explicit user approval. Use PyPI/npm, approved internal
 mirrors, or a pinned/approved toolchain. Do not use `curl | sh` installers.
+Install Node.js through an approved OS package manager or controlled toolchain and
+verify it with `node --version`; there is no universal cross-platform silent command.
 Install Python CLI tools in a dedicated virtual environment, `pipx`, or an approved
 tool environment rather than modifying system Python.
 If global npm installs are blocked, or the target environment is not a

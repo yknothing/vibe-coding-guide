@@ -1348,6 +1348,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "typed.ts"
             target.write_text(
                 "export function identity(value: string): string { return value; }\n",
@@ -1399,6 +1400,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "clean.js"
             target.write_text("export const label = 'ok';\n", encoding="utf-8")
             ignored_payload = json.dumps(
@@ -1442,6 +1444,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "clean.js"
             target.write_text("export const label = 'ok';\n", encoding="utf-8")
             clean_payload = json.dumps([{"filePath": str(target), "messages": []}])
@@ -1474,6 +1477,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             bin_dir = workspace / "bin"
             launch_dir.mkdir()
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             resolved_workspace = workspace.resolve()
             target = workspace / "bad.js"
             target.write_text("export function timeout() { return 5000; }\n", encoding="utf-8")
@@ -1548,6 +1552,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             python_target = workspace / "constants.py"
             javascript_target = workspace / "complex.js"
             python_target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
@@ -1587,6 +1592,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             javascript_target = workspace / "clean.js"
             typescript_target = workspace / "typed.ts"
             javascript_target.write_text("export const label = 'ok';\n", encoding="utf-8")
@@ -1742,6 +1748,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "bad.js"
             target.write_text("export function timeout() { return 5000; }\n", encoding="utf-8")
             eslint_payload = json.dumps(
@@ -1781,6 +1788,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "clean.js"
             target.write_text("export const label = 'ok';\n", encoding="utf-8")
             eslint_payload = json.dumps(
@@ -1809,6 +1817,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "clean.js"
             target.write_text("export const LABEL = 'ok';\n", encoding="utf-8")
             eslint_payload = json.dumps([{"filePath": str(target), "messages": []}])
@@ -1835,6 +1844,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "clean.ts"
             target.write_text("export const label: string = 'ok';\n", encoding="utf-8")
             warning_payload = json.dumps(
@@ -1875,6 +1885,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             target = workspace / "clean.js"
             target.write_text("export const label = 'ok';\n", encoding="utf-8")
             eslint_payload = json.dumps([{"filePath": "\0", "messages": []}])
@@ -2068,6 +2079,63 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(report["skipped_files"][0]["path"], "README.md")
             self.assertEqual(report["skipped_files"][0]["reason"], "unsupported_extension")
             self.assertEqual(report["summary"]["scanned_file_count"], 0)
+
+    def test_cyclic_scan_inputs_are_structured_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+            cyclic_path = workspace / "cyclic-input"
+            try:
+                cyclic_path.symlink_to(cyclic_path.name)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+
+            cases = (
+                (
+                    "file",
+                    ["--files", str(cyclic_path)],
+                    "path-resolution",
+                ),
+                (
+                    "baseline",
+                    [
+                        "--files",
+                        str(target),
+                        "--ratchet-baseline",
+                        str(cyclic_path),
+                    ],
+                    "ratchet-baseline",
+                ),
+                (
+                    "rules",
+                    ["--files", str(target), "--rules-dir", str(cyclic_path)],
+                    "rule-config",
+                ),
+            )
+            for name, arguments, expected_tool in cases:
+                with self.subTest(name=name):
+                    result = subprocess.run(
+                        [sys.executable, str(HOOK), "--format", "json", *arguments],
+                        cwd=workspace,
+                        env={**os.environ, **MISSING_DETECTOR_ENV},
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+                    report = json.loads(result.stdout)
+                    self.assertEqual(report["status"], "error")
+                    self.assertIn(
+                        expected_tool,
+                        {error["tool"] for error in report["tool_errors"]},
+                    )
+                    if name == "file":
+                        self.assertEqual(
+                            report["skipped_files"][0]["reason"],
+                            "unresolvable_path",
+                        )
 
     def test_empty_files_argument_is_incomplete_not_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2347,6 +2415,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             local_bin = workspace / "node_modules" / ".bin"
             bin_dir.mkdir()
             local_bin.mkdir(parents=True)
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             make_executable(local_bin / "eslint", doctor_eslint_script())
             make_executable(
                 bin_dir / "eslint",
@@ -2454,6 +2523,42 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "not_applicable")
             self.assertEqual(report["detectors"]["lizard"]["run"]["status"], "not_applicable")
 
+    def test_strict_eslint_scan_rejects_invalid_node_pin_without_path_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            target = workspace / "clean.js"
+            target.write_text("const LABEL = 'ok';\n", encoding="utf-8")
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
+            make_executable(bin_dir / "eslint", doctor_eslint_script())
+            make_executable(bin_dir / "lizard", lizard_script([target]))
+            cyclic_node = workspace / "cyclic-node"
+            try:
+                cyclic_node.symlink_to(cyclic_node.name)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--scan-profile",
+                "javascript",
+                "--require-tools",
+                env={
+                    "PATH": str(bin_dir),
+                    "VCG_NODE_BIN": str(cyclic_node),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertEqual(report["decision"]["outcome"], "error")
+            self.assertIn("eslint", {error["tool"] for error in report["tool_errors"]})
+            self.assertEqual(report["detectors"]["eslint"]["run"]["status"], "missing")
+            self.assertIsNone(report["detectors"]["eslint"]["node_runtime"])
+
     def test_windows_eslint_prefix_pins_node_and_javascript_entrypoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -2481,6 +2586,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
             make_executable(bin_dir / "ruff", doctor_ruff_script())
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             make_executable(bin_dir / "eslint", doctor_eslint_script())
             make_executable(bin_dir / "lizard", doctor_lizard_script())
 
@@ -2518,6 +2624,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             workspace = Path(tmp)
             bin_dir = workspace / "bin"
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             make_executable(
                 bin_dir / "eslint",
                 "#!/bin/sh\n"
@@ -2578,6 +2685,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 "export const existing: string = 'ok';\n",
                 encoding="utf-8",
             )
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             make_executable(
                 bin_dir / "eslint",
                 doctor_eslint_script(reject_disabled_config=True),
@@ -2635,6 +2743,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             examples_dir.mkdir()
             source_dir.mkdir()
             bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
             (examples_dir / "first.ts").write_text("export const first = 'ok';\n", encoding="utf-8")
             (source_dir / "real.ts").write_text("export const real = 'ok';\n", encoding="utf-8")
             make_executable(
@@ -2708,6 +2817,231 @@ class PostToolUseQualityGateTests(unittest.TestCase):
             self.assertEqual(check["status"], "fail")
             self.assertFalse(check["detail"]["inside_root"])
             self.assertEqual(report["profiles"]["python"]["probes"], {})
+
+    def test_doctor_rejects_cyclic_probe_dir_as_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            make_executable(bin_dir / "ruff", doctor_ruff_script())
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+            cyclic_path = workspace / "cyclic-probe"
+            try:
+                cyclic_path.symlink_to(cyclic_path.name)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--probe-dir",
+                    cyclic_path.name,
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, "PATH": str(bin_dir)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            probe_check = next(
+                check for check in report["checks"] if check["id"] == "probe.directory"
+            )
+            self.assertEqual(probe_check["status"], "fail")
+            self.assertIsNone(probe_check["detail"]["resolved"])
+            self.assertTrue(probe_check["detail"]["error"])
+            self.assertEqual(report["profiles"]["python"]["probes"], {})
+            self.assertFalse(report["adapter_launch"]["ready"])
+
+    def test_doctor_rejects_cyclic_root_as_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            cyclic_path = workspace / "cyclic-root"
+            try:
+                cyclic_path.symlink_to(cyclic_path.name)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(cyclic_path),
+                ],
+                cwd=workspace,
+                env={**os.environ, **MISSING_DETECTOR_ENV},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            root_check = next(
+                check for check in report["checks"] if check["id"] == "project.root"
+            )
+            self.assertEqual(root_check["status"], "fail")
+            self.assertTrue(root_check["detail"]["errors"])
+            self.assertEqual(report["profiles"]["python"]["probes"], {})
+            self.assertFalse(report["adapter_launch"]["ready"])
+
+    def test_doctor_rejects_cyclic_rules_dir_as_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            cyclic_path = workspace / "cyclic-rules"
+            try:
+                cyclic_path.symlink_to(cyclic_path.name)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--rules-dir",
+                    str(cyclic_path),
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={**os.environ, **MISSING_DETECTOR_ENV},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            rules_check = next(
+                check for check in report["checks"] if check["id"] == "rules.load"
+            )
+            self.assertEqual(rules_check["status"], "fail")
+            self.assertIsNone(rules_check["detail"]["resolved"])
+            self.assertEqual(report["profiles"]["python"]["probes"], {})
+            self.assertFalse(report["adapter_launch"]["ready"])
+
+    def test_doctor_rejects_cyclic_detector_override_as_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+            cyclic_path = workspace / "cyclic-ruff"
+            try:
+                cyclic_path.symlink_to(cyclic_path.name)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "python",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={
+                    **os.environ,
+                    "PATH": str(bin_dir),
+                    "VCG_RUFF_BIN": str(cyclic_path),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            ruff_check = next(
+                check for check in report["checks"] if check["id"] == "detector.ruff"
+            )
+            self.assertEqual(ruff_check["status"], "fail")
+            self.assertFalse(ruff_check["detail"]["available"])
+            self.assertEqual(ruff_check["detail"]["override_value"], str(cyclic_path))
+            self.assertEqual(report["profiles"]["python"]["probes"], {})
+            self.assertFalse(report["adapter_launch"]["ready"])
+
+    def test_doctor_rejects_cyclic_node_override_as_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            make_executable(bin_dir / "node", "#!/bin/sh\nexec \"$@\"\n")
+            make_executable(bin_dir / "eslint", doctor_eslint_script())
+            make_executable(bin_dir / "lizard", doctor_lizard_script())
+            cyclic_path = workspace / "cyclic-node"
+            try:
+                cyclic_path.symlink_to(cyclic_path.name)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"Symlinks unavailable: {exc}")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(HOOK),
+                    "--doctor",
+                    "--profile",
+                    "javascript",
+                    "--require-tools",
+                    "--format",
+                    "json",
+                    "--root",
+                    str(workspace),
+                ],
+                cwd=workspace,
+                env={
+                    **os.environ,
+                    "PATH": str(bin_dir),
+                    "VCG_NODE_BIN": str(cyclic_path),
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+            report = json.loads(result.stdout)
+            eslint_check = next(
+                check for check in report["checks"] if check["id"] == "detector.eslint"
+            )
+            self.assertEqual(eslint_check["status"], "fail")
+            self.assertTrue(eslint_check["detail"]["available"])
+            self.assertIsNone(eslint_check["detail"]["node_runtime"])
+            self.assertEqual(
+                eslint_check["detail"]["node_override_value"], str(cyclic_path)
+            )
+            self.assertEqual(report["profiles"]["javascript"]["probes"], {})
+            self.assertFalse(report["adapter_launch"]["ready"])
 
     def test_python_runtime_check_rejects_pre_311(self) -> None:
         module = load_hook_module()

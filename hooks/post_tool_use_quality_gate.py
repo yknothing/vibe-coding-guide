@@ -409,13 +409,6 @@ def apply_rule_metadata(issues: list[Issue], rules: dict[str, Rule]) -> list[Iss
     return hydrated
 
 
-def determine_root(args: argparse.Namespace, event: dict[str, Any] | None) -> Path:
-    raw_root = args.root or os.environ.get("CLAUDE_PROJECT_DIR")
-    if raw_root is None and event is not None:
-        raw_root = event.get("cwd")
-    return Path(raw_root or os.getcwd()).expanduser().resolve()
-
-
 def request_root(
     args: argparse.Namespace,
     event: dict[str, Any] | None,
@@ -439,13 +432,23 @@ def request_root(
     return root, errors
 
 
-def request_baseline_path(raw_path: Path | None, root: Path) -> Path | None:
+def request_baseline_path(
+    raw_path: Path | None, root: Path
+) -> tuple[Path | None, list[ToolError]]:
     if raw_path is None:
-        return None
-    path = raw_path.expanduser()
-    if not path.is_absolute():
-        path = root / path
-    return path.resolve(strict=False)
+        return None, []
+    try:
+        path = raw_path.expanduser()
+        if not path.is_absolute():
+            path = root / path
+        return path.resolve(strict=False), []
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, [
+            ToolError(
+                "ratchet-baseline",
+                f"Ratchet baseline path could not be resolved: {exc}",
+            )
+        ]
 
 
 def event_string(
@@ -524,6 +527,9 @@ def build_quality_gate_request(
                 )
             )
 
+    baseline_path, baseline_errors = request_baseline_path(args.ratchet_baseline, root)
+    errors.extend(baseline_errors)
+
     request = QualityGateRequest(
         schema_version=REQUEST_SCHEMA_VERSION,
         root=root,
@@ -532,7 +538,7 @@ def build_quality_gate_request(
         adapter=adapter,
         hook_event_name=hook_event_name,
         tool_name=tool_name,
-        baseline_path=request_baseline_path(args.ratchet_baseline, root),
+        baseline_path=baseline_path,
         strict=args.require_tools,
         complexity_threshold=threshold,
         complexity_threshold_source=threshold_source,
@@ -638,14 +644,14 @@ def command_version(command: str | list[str]) -> str | None:
 def find_detector(detector: str, root: Path | None = None) -> str | None:
     override = os.environ.get(DETECTOR_OVERRIDE_ENV[detector])
     if override:
-        return executable_path(Path(override).expanduser())
+        return executable_path(Path(override))
     if detector == "eslint" and root is not None:
         local_path = shutil.which(detector, path=str(root / "node_modules" / ".bin"))
         if local_path:
-            return str(Path(local_path).resolve())
+            return executable_path(Path(local_path))
     path = shutil.which(detector)
     if path:
-        return str(Path(path).resolve())
+        return executable_path(Path(path))
     if detector == "eslint":
         return None
     sibling_name = f"{detector}.exe" if os.name == "nt" else detector
@@ -653,7 +659,10 @@ def find_detector(detector: str, root: Path | None = None) -> str | None:
 
 
 def executable_path(path: Path) -> str | None:
-    resolved = path.resolve()
+    try:
+        resolved = path.expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
     if resolved.is_file() and (os.name == "nt" or os.access(resolved, os.X_OK)):
         return str(resolved)
     return None
@@ -662,14 +671,14 @@ def executable_path(path: Path) -> str | None:
 def find_node_runtime(eslint: str | None = None) -> str | None:
     override = os.environ.get(NODE_OVERRIDE_ENV)
     if override:
-        return executable_path(Path(override).expanduser())
+        return executable_path(Path(override))
     if eslint:
         sibling_name = "node.exe" if os.name == "nt" else "node"
         sibling = executable_path(Path(eslint).resolve().parent / sibling_name)
         if sibling:
             return sibling
     path = shutil.which("node")
-    return str(Path(path).resolve()) if path else None
+    return executable_path(Path(path)) if path else None
 
 
 def eslint_command_prefix(eslint: str, platform_name: str = os.name) -> list[str]:
@@ -728,23 +737,42 @@ def detector_inventory(
     inventory: dict[str, dict[str, Any]] = {}
     for detector in REQUIRED_DETECTORS:
         path = find_detector(detector, root)
+        node_runtime = detector_node_runtime(detector, path)
         info: dict[str, Any] = {
             "available": path is not None,
             "path": path,
-            "version": (
-                command_version(eslint_command_prefix(path))
-                if path and detector == "eslint"
-                else command_version(path)
-                if path
-                else None
-            ),
+            "version": detector_version(detector, path, node_runtime),
             "override_env": DETECTOR_OVERRIDE_ENV[detector],
             "override_value": os.environ.get(DETECTOR_OVERRIDE_ENV[detector]),
         }
+        if detector == "eslint":
+            info.update(
+                {
+                    "node_runtime": node_runtime,
+                    "node_override_env": NODE_OVERRIDE_ENV,
+                    "node_override_value": os.environ.get(NODE_OVERRIDE_ENV),
+                }
+            )
         if include_install:
             info["install"] = detector_install_info(detector)
         inventory[detector] = info
     return inventory
+
+
+def detector_node_runtime(detector: str, path: str | None) -> str | None:
+    if detector != "eslint" or path is None:
+        return None
+    return find_node_runtime(path)
+
+
+def detector_version(
+    detector: str, path: str | None, node_runtime: str | None
+) -> str | None:
+    if path is None:
+        return None
+    if detector == "eslint":
+        return command_version(eslint_command_prefix(path)) if node_runtime else None
+    return command_version(path)
 
 
 def detector_remediation(detector: str, profiles: tuple[str, ...] = ()) -> str:
@@ -986,7 +1014,7 @@ def execute_doctor_probe_scan(
         complexity_threshold_source=None,
     )
     policy, policy_errors = effective_policy(request, rules)
-    files, skipped = resolve_scan_files(list(request.files), request.root)
+    files, skipped, path_errors = resolve_scan_files(list(request.files), request.root)
     issues, tool_errors, outcomes = scan_files(
         files,
         request.root,
@@ -994,7 +1022,7 @@ def execute_doctor_probe_scan(
         request.strict,
     )
     issues = apply_rule_metadata(issues, rules)
-    errors = dedupe_tool_errors([*policy_errors, *tool_errors])
+    errors = dedupe_tool_errors([*policy_errors, *path_errors, *tool_errors])
     decision = build_decision(
         issues,
         errors,
@@ -1133,40 +1161,58 @@ def execute_doctor_profile_probe(
     }
 
 
-def doctor_environment_checks(root: Path) -> tuple[list[DoctorCheck], DoctorCheck]:
+def doctor_environment_checks(
+    root: Path, root_errors: list[ToolError] | None = None
+) -> tuple[list[DoctorCheck], DoctorCheck]:
+    root_errors = root_errors or []
     runtime_check = python_runtime_check()
-    root_is_directory = root.is_dir()
-    script_executable = os.access(__file__, os.X_OK)
     checks = [
         runtime_check,
-        DoctorCheck(
-            id="project.root",
-            status="pass" if root_is_directory else "fail",
-            message=(
-                f"Project root is a directory: {root}"
-                if root_is_directory
-                else f"Project root is missing or not a directory: {root}"
-            ),
-            detail={"root": root.as_posix()},
-            remediation=None
-            if root_is_directory
-            else "Pass --root or run the command from the project root.",
-        ),
-        DoctorCheck(
-            id="script.executable",
-            status="pass" if script_executable else "warn",
-            message=(
-                "Hook script is executable."
-                if script_executable
-                else "Hook script is not executable; invoke it with python3 or chmod +x it."
-            ),
-            detail={"path": Path(__file__).resolve().as_posix()},
-            remediation=None
-            if script_executable
-            else "Run via `python3` or set executable bit.",
-        ),
+        doctor_project_root_check(root, root_errors),
+        doctor_script_check(),
     ]
     return checks, runtime_check
+
+
+def doctor_project_root_check(
+    root: Path, root_errors: list[ToolError]
+) -> DoctorCheck:
+    root_is_directory = root.is_dir() and not root_errors
+    if root_is_directory:
+        message = f"Project root is a directory: {root}"
+    elif root_errors:
+        message = "; ".join(error.message for error in root_errors)
+    else:
+        message = f"Project root is missing or not a directory: {root}"
+    return DoctorCheck(
+        id="project.root",
+        status="pass" if root_is_directory else "fail",
+        message=message,
+        detail={
+            "root": root.as_posix(),
+            "errors": [dataclasses.asdict(error) for error in root_errors],
+        },
+        remediation=None
+        if root_is_directory
+        else "Pass --root or run the command from the project root.",
+    )
+
+
+def doctor_script_check() -> DoctorCheck:
+    script_executable = os.access(__file__, os.X_OK)
+    return DoctorCheck(
+        id="script.executable",
+        status="pass" if script_executable else "warn",
+        message=(
+            "Hook script is executable."
+            if script_executable
+            else "Hook script is not executable; invoke it with python3 or chmod +x it."
+        ),
+        detail={"path": Path(__file__).resolve().as_posix()},
+        remediation=None
+        if script_executable
+        else "Run via `python3` or set executable bit.",
+    )
 
 
 def doctor_rules_check(
@@ -1223,6 +1269,37 @@ def doctor_rules_check(
     )
 
 
+def resolve_doctor_rules_directory(
+    rules_dir: Path,
+) -> tuple[Path, DoctorCheck | None]:
+    try:
+        return rules_dir.expanduser().resolve(), None
+    except (OSError, RuntimeError, ValueError) as exc:
+        return rules_dir, DoctorCheck(
+            id="rules.load",
+            status="fail",
+            message=f"Rules directory could not be resolved: {exc}",
+            detail={
+                "requested": str(rules_dir),
+                "resolved": None,
+                "error": str(exc),
+            },
+            remediation="Pass an existing, non-cyclic --rules-dir, then rerun doctor.",
+        )
+
+
+def load_scan_rules(raw_rules_dir: str) -> tuple[dict[str, Rule], list[ToolError]]:
+    try:
+        rules_dir = Path(raw_rules_dir).expanduser().resolve()
+        return load_rules(rules_dir), []
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {}, [
+            ToolError("rule-config", f"Rules directory could not be resolved: {exc}")
+        ]
+    except RuleValidationError as exc:
+        return {}, [ToolError("rule-config", str(exc))]
+
+
 def doctor_detector_checks(
     detectors: dict[str, dict[str, Any]],
     required_detectors: tuple[str, ...],
@@ -1233,22 +1310,39 @@ def doctor_detector_checks(
     for detector in required_detectors:
         info = detectors[detector]
         available = bool(info["available"])
+        ready = detector_ready(detector, info)
+        node_missing = detector == "eslint" and available and not info["node_runtime"]
         checks.append(
             DoctorCheck(
                 id=f"detector.{detector}",
-                status="pass" if available else "fail" if require_tools else "warn",
+                status="pass" if ready else "fail" if require_tools else "warn",
                 message=(
                     f"{detector} found at {info['path']}"
-                    if available
+                    if ready
+                    else f"{detector} found, but its Node runtime could not be resolved."
+                    if node_missing
                     else f"{detector} not found; strict --require-tools mode will fail closed."
                 ),
                 detail=info,
                 remediation=None
-                if available
+                if ready
+                else (
+                    "Install a supported Node.js runtime through an approved package source, "
+                    "set VCG_NODE_BIN to its absolute executable path, verify with "
+                    "`node --version` and `eslint --version`, then rerun doctor."
+                )
+                if node_missing
                 else detector_remediation(detector, profiles),
             )
         )
     return checks
+
+
+def detector_ready(detector: str, info: dict[str, Any]) -> bool:
+    return bool(
+        info["available"]
+        and (detector != "eslint" or info.get("node_runtime"))
+    )
 
 
 def unavailable_profile_probe(profile: str) -> dict[str, Any]:
@@ -1273,6 +1367,7 @@ def doctor_profile_checks(
     rules: dict[str, Rule],
     rules_ready: bool,
     runtime_ready: bool,
+    root_ready: bool,
     project_root: Path,
     probe_directory: Path | None,
     probe_directory_ready: bool,
@@ -1283,13 +1378,15 @@ def doctor_profile_checks(
     checks: list[DoctorCheck] = []
     for profile in profiles:
         detector_names = DOCTOR_PROFILE_DETECTORS[profile]
-        detectors_ready = all(bool(detectors[name]["available"]) for name in detector_names)
+        detectors_ready = all(
+            detector_ready(name, detectors[name]) for name in detector_names
+        )
         result = (
             run_doctor_profile_probe(profile, rules, project_root, probe_directory)
             if doctor_profile_prerequisites_ready(
                 runtime_ready,
                 rules_ready,
-                project_root,
+                root_ready,
                 probe_directory_ready,
                 detectors_ready,
             )
@@ -1316,7 +1413,7 @@ def doctor_profile_checks(
 def doctor_profile_prerequisites_ready(
     runtime_ready: bool,
     rules_ready: bool,
-    project_root: Path,
+    root_ready: bool,
     probe_directory_ready: bool,
     detectors_ready: bool,
 ) -> bool:
@@ -1324,7 +1421,7 @@ def doctor_profile_prerequisites_ready(
         (
             runtime_ready,
             rules_ready,
-            project_root.is_dir(),
+            root_ready,
             probe_directory_ready,
             detectors_ready,
         )
@@ -1342,8 +1439,27 @@ def requested_doctor_probe_directory(
 ) -> tuple[Path | None, DoctorCheck | None]:
     if raw_probe_directory is None:
         return None, None
-    raw_path = Path(raw_probe_directory).expanduser()
-    candidate = (raw_path if raw_path.is_absolute() else project_root / raw_path).resolve()
+    try:
+        raw_path = Path(raw_probe_directory).expanduser()
+        candidate = (
+            raw_path if raw_path.is_absolute() else project_root / raw_path
+        ).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, DoctorCheck(
+            id="probe.directory",
+            status="fail",
+            message="Doctor probe directory could not be resolved.",
+            detail={
+                "requested": raw_probe_directory,
+                "resolved": None,
+                "inside_root": False,
+                "error": str(exc),
+            },
+            remediation=(
+                "Pass an existing, non-cyclic project-relative --probe-dir covered by "
+                "the selected language config."
+            ),
+        )
     try:
         candidate.relative_to(project_root)
         inside_root = True
@@ -1370,6 +1486,14 @@ def requested_doctor_probe_directory(
     return (candidate if valid else None), check
 
 
+def adapter_scan_profile(
+    validated_profiles: tuple[str, ...], ready: bool
+) -> str | None:
+    if not ready:
+        return None
+    return validated_profiles[0] if len(validated_profiles) == 1 else "all"
+
+
 def adapter_launch_contract(
     detectors: dict[str, dict[str, Any]],
     requested_profiles: tuple[str, ...],
@@ -1379,22 +1503,24 @@ def adapter_launch_contract(
     rules_dir: Path,
 ) -> dict[str, Any]:
     core_argv = [str(Path(sys.executable).resolve()), str(Path(__file__).resolve())]
-    scan_profile = (
-        validated_profiles[0] if len(validated_profiles) == 1 else "all"
-    ) if ready else None
+    scan_profile = adapter_scan_profile(validated_profiles, ready)
     environment = {
         DETECTOR_OVERRIDE_ENV[detector]: str(info["path"])
         for detector, info in detectors.items()
         if info.get("path")
     }
-    node_runtime = find_node_runtime(detectors["eslint"].get("path"))
+    node_runtime = (
+        detectors["eslint"].get("node_runtime")
+        if "eslint" in required_profile_detectors(requested_profiles)
+        else None
+    )
     if node_runtime:
         environment[NODE_OVERRIDE_ENV] = node_runtime
     pinned_arguments = [
         "--root",
-        str(project_root.resolve()),
+        str(project_root),
         "--rules-dir",
-        str(rules_dir.resolve()),
+        str(rules_dir),
         "--require-tools",
         "--scan-profile",
         str(scan_profile),
@@ -1433,8 +1559,8 @@ def adapter_launch_contract(
         "requested_profiles": list(requested_profiles),
         "validated_profiles": list(validated_profiles),
         "scan_profile": scan_profile,
-        "project_root": str(project_root.resolve()),
-        "rules_dir": str(rules_dir.resolve()),
+        "project_root": str(project_root),
+        "rules_dir": str(rules_dir),
         "node_runtime": node_runtime,
         "claude_posix_command": claude_posix_command,
         "notes": (
@@ -1464,15 +1590,20 @@ def build_doctor_report(
     require_tools: bool,
     profile: str = "all",
     raw_probe_directory: str | None = None,
+    root_errors: list[ToolError] | None = None,
 ) -> dict[str, Any]:
-    rules_dir = rules_dir.expanduser().resolve()
-    checks, runtime_check = doctor_environment_checks(root)
+    checks, runtime_check = doctor_environment_checks(root, root_errors)
+    root_check = next(check for check in checks if check.id == "project.root")
     probe_directory, probe_directory_check = requested_doctor_probe_directory(
         root, raw_probe_directory
     )
     if probe_directory_check:
         checks.append(probe_directory_check)
-    rules, loaded_rules, rules_check = doctor_rules_check(rules_dir)
+    rules_dir, rules_resolution_check = resolve_doctor_rules_directory(rules_dir)
+    if rules_resolution_check:
+        rules, loaded_rules, rules_check = {}, [], rules_resolution_check
+    else:
+        rules, loaded_rules, rules_check = doctor_rules_check(rules_dir)
     checks.append(rules_check)
     detectors = detector_inventory(root, include_install=True)
     selected_profiles = selected_doctor_profiles(profile)
@@ -1492,6 +1623,7 @@ def build_doctor_report(
         rules,
         rules_check.status == "pass",
         runtime_check.status == "pass",
+        root_check.status == "pass",
         root,
         probe_directory,
         probe_directory_check is None or probe_directory_check.status == "pass",
@@ -1604,13 +1736,16 @@ def render_adapter_launch(launch: dict[str, Any]) -> list[str]:
     ]
 
 
-def run_doctor(args: argparse.Namespace, root: Path) -> int:
+def run_doctor(
+    args: argparse.Namespace, root: Path, root_errors: list[ToolError] | None = None
+) -> int:
     report = build_doctor_report(
         root,
         Path(args.rules_dir),
         args.require_tools,
         args.profile,
         args.probe_dir,
+        root_errors,
     )
     if args.format == "json":
         print(json.dumps(report, ensure_ascii=False, indent=JSON_INDENT))
@@ -1652,18 +1787,31 @@ def git_changed_files(root: Path) -> list[str]:
     return paths
 
 
-def resolve_scan_files(raw_paths: list[str], root: Path) -> tuple[list[Path], list[SkippedFile]]:
+def resolve_scan_files(
+    raw_paths: list[str], root: Path
+) -> tuple[list[Path], list[SkippedFile], list[ToolError]]:
     files: list[Path] = []
     skipped: list[SkippedFile] = []
+    errors: list[ToolError] = []
     seen: set[Path] = set()
     for raw_path in raw_paths:
         if not raw_path:
             skipped.append(SkippedFile(path="", reason="empty_path"))
             continue
-        candidate = Path(raw_path).expanduser()
-        if not candidate.is_absolute():
-            candidate = root / candidate
-        resolved = candidate.resolve(strict=False)
+        try:
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            skipped.append(SkippedFile(path=raw_path, reason="unresolvable_path"))
+            errors.append(
+                ToolError(
+                    "path-resolution",
+                    f"Scan path {raw_path!r} could not be resolved: {exc}",
+                )
+            )
+            continue
         try:
             resolved.relative_to(root)
         except ValueError:
@@ -1680,11 +1828,11 @@ def resolve_scan_files(raw_paths: list[str], root: Path) -> tuple[list[Path], li
             seen.add(resolved)
         else:
             skipped.append(SkippedFile(path=relative_path(resolved, root), reason="not_a_file"))
-    return files, skipped
+    return files, skipped, errors
 
 
 def normalize_scan_files(raw_paths: list[str], root: Path) -> list[Path]:
-    files, _ = resolve_scan_files(raw_paths, root)
+    files, _, _ = resolve_scan_files(raw_paths, root)
     return files
 
 
@@ -2447,6 +2595,14 @@ def run_eslint(
         return [], [ToolError("eslint", message)], DetectorOutcome(
             "missing", "none", outcome_files, message=message
         )
+    node_runtime = find_node_runtime(eslint)
+    if not node_runtime:
+        message = (
+            "ESLint requires an absolute Node runtime; set VCG_NODE_BIN and rerun doctor."
+        )
+        return [], [ToolError("eslint", message)], DetectorOutcome(
+            "missing", "none", outcome_files, message=message
+        )
 
     rule_config = json.dumps(
         {
@@ -3061,8 +3217,8 @@ def main(argv: list[str]) -> int:
     input_errors: list[ToolError] = []
 
     if args.doctor:
-        root = determine_root(args, None)
-        return run_doctor(args, root)
+        root, root_errors = request_root(args, None, Path.cwd())
+        return run_doctor(args, root, root_errors)
 
     if args.hook:
         try:
@@ -3073,22 +3229,17 @@ def main(argv: list[str]) -> int:
     request, request_errors = build_quality_gate_request(args, event, Path.cwd())
     input_errors.extend(request_errors)
     root = request.root
-    rule_errors: list[ToolError] = []
-    rules: dict[str, Rule] = {}
-    try:
-        rules = load_rules(Path(args.rules_dir))
-    except RuleValidationError as exc:
-        rule_errors.append(ToolError("rule-config", str(exc)))
+    rules, rule_errors = load_scan_rules(args.rules_dir)
     policy, policy_errors = effective_policy(request, rules)
     policy["scan_profile"] = args.scan_profile
     rule_errors.extend(policy_errors)
 
-    files, skipped_files = resolve_scan_files(list(request.files), root)
+    files, skipped_files, path_errors = resolve_scan_files(list(request.files), root)
     files, profile_skipped, profile_errors = enforce_scan_profile(
         files, args.scan_profile, root
     )
     skipped_files.extend(profile_skipped)
-    input_errors.extend(profile_errors)
+    input_errors.extend([*path_errors, *profile_errors])
 
     metrics = collect_quality_metrics(files, root)
     ratchet, ratchet_errors = evaluate_ratchet(metrics, request.baseline_path)
