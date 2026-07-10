@@ -80,6 +80,11 @@
         "description": "The recommended action from the rule's 'act' (e.g., RQR, RCM, FIX).",
         "enum": ["RQR", "RCM", "FIX", "CNF", "EDU", "LOG", "WARN"]
       },
+      "enforcement": {
+        "type": "string",
+        "description": "Gate behavior declared by the rule.",
+        "enum": ["block", "warn", "observe"]
+      },
       "autofix_available": {
         "type": "boolean",
         "default": false,
@@ -125,6 +130,7 @@
       "message",
       "detailed_explanation",
       "suggested_action",
+      "enforcement",
       "rule_version",
       "scan_timestamp"
     ]

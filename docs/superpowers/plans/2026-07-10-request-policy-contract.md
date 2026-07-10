@@ -29,15 +29,15 @@
 
 ## Batch B: Make Policy Executable
 
-- [ ] Add `gate.enforcement` to the five existing rules: `IMP_004` and `IMP_007` block; `MNT_001` warns; `DSN_001` and `MNT_002` observe.
-- [ ] Validate required gate objects, enforcement enum, and positive `IMP_007` threshold in `rule_loader`.
-- [ ] Add failing tests for missing/invalid enforcement, invalid threshold, YAML threshold behavior, tightening overrides, and relaxation rejection.
-- [ ] Hydrate issue enforcement and compute a standalone decision with enforcement counts and rule ids.
-- [ ] Add report `decision` and effective `policy` fields; keep issue schema and existing status consumers compatible.
-- [ ] Drive direct/hook exit codes from decision and test block/warn/observe/mixed/tool-error/incomplete/ratchet cases.
-- [ ] Update adapter and hook documentation.
-- [ ] Run focused tests, full suite, Ruff, compile, rule validation, diff check, real repository replay, and non-author review.
-- [ ] Commit Batch B independently.
+- [x] Add `gate.enforcement` to the five existing rules: `IMP_004` and `IMP_007` block; `MNT_001` warns; `DSN_001` and `MNT_002` observe.
+- [x] Validate required gate objects, enforcement enum, and positive `IMP_007` threshold in `rule_loader`.
+- [x] Add failing tests for missing/invalid enforcement, invalid threshold, YAML threshold behavior, tightening overrides, and relaxation rejection.
+- [x] Hydrate issue enforcement and compute a standalone decision with enforcement counts and rule ids.
+- [x] Add report `decision` and effective `policy` fields; keep issue schema and existing status consumers compatible.
+- [x] Drive direct/hook exit codes from decision and test block/warn/observe/mixed/tool-error/incomplete/ratchet cases.
+- [x] Update adapter and hook documentation.
+- [x] Run focused tests, full suite, Ruff, compile, rule validation, diff check, real repository replay, and non-author review.
+- [x] Commit Batch B independently.
 
 ## Deferred
 

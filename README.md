@@ -61,6 +61,9 @@ JSON report 的 `status` 可能是 `pass`、`fail`、`error` 或 `incomplete`。
 每个 detector 的本次运行真相位于 `detectors.<name>.run`，包括 `status`、`coverage`、
 适用文件、fallback 和 `uncovered_files`。`not_applicable` 与缺工具不同；TypeScript
 ignored/parser/config diagnostic 是 `error`，不能解释为无问题。
+报告中的 `decision` 区分 `block`、`warn` 和 `observe`，每条 issue 都携带
+`enforcement`；`policy` 记录本次有效复杂度阈值及来源。warn/observe 不阻断，但不得被
+adapter 静默丢弃。
 
 ## 实际目录结构（与磁盘一致）
 

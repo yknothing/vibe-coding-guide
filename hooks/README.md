@@ -128,6 +128,11 @@ cover every requested file and the run cannot pass.
 For zero-function files, an empty lizard CSV is accepted only after lizard's XML
 File measure explicitly confirms that the requested file was processed.
 
+Rule enforcement is explicit: `block`, `warn`, or `observe`. Reports include
+`decision`, per-enforcement counts, issue-level `enforcement`, and the effective
+`policy`. Warn and observe findings exit 0 but remain visible. The IMP_007 YAML
+threshold is authoritative; CLI/environment overrides may tighten it, never relax it.
+
 `status: incomplete` means the gate did not scan any supported files, usually
 because every input path was unsupported, outside the project, duplicated, or
 missing. Treat it as "no quality claim," not as a pass.

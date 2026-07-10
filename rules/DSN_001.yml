@@ -8,5 +8,5 @@ met: {"type": "pass_through_abstraction", "expr": {"function_body_only_delegates
 det: [{"tool": "sa", "rule": "python_ast_pass_through_function"}]
 act: "RCM"
 autofix: {"type": "manual_assist"}
-gate: {"detector": "python_pass_through_function", "scope": "pure_single_call"}
+gate: {"detector": "python_pass_through_function", "enforcement": "observe", "scope": "pure_single_call"}
 rat: "透传函数缺少抽象增益 -> 层次膨胀 调用链变长 修改时多一处同步成本 ; #模块设计 #抽象层次"

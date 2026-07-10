@@ -4,9 +4,9 @@ sev: "H"
 cat: "IMP"
 lang: ["*"]
 state: "P"
-met: {"type": "cyclomatic_complexity_check", "expr": {"cyclomatic_complexity": ">10"}, "cfg_key": "MAX_CYCLOMATIC_COMPLEXITY_IMP_007"}
+met: {"type": "cyclomatic_complexity_check", "expr": {"cyclomatic_complexity": "gate.threshold"}}
 det: [{"tool": "lzd", "rule": "cyclomatic_complexity_threshold"}, {"tool": "sa", "rule": "python_ast_complexity_fallback"}]
 act: "RCM"
 autofix: {"type": "manual_assist"}
-gate: {"detector": "function_complexity", "metric": "cyclomatic_complexity", "threshold": 10}
+gate: {"detector": "function_complexity", "enforcement": "block", "metric": "cyclomatic_complexity", "threshold": 10}
 rat: "复杂逻辑可读性差 -> 难以理解和维护 缺陷高发区域 重构难度大 ; #代码复杂度 #可读性优先"

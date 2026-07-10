@@ -420,9 +420,135 @@ class PostToolUseQualityGateTests(unittest.TestCase):
 
             result = self.run_hook(workspace, payload)
 
-            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("MNT_001", result.stderr)
             self.assertIn("endpoint.py", result.stderr)
+
+    def test_warn_decision_is_visible_and_allows_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "endpoint.py"
+            target.write_text('API_URL = "http://localhost:3000/v1"\n', encoding="utf-8")
+            payload = {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Write",
+                "cwd": str(workspace),
+                "tool_input": {"file_path": "endpoint.py"},
+            }
+
+            result = self.run_hook(workspace, payload, "--format", "json")
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "pass")
+            self.assertEqual(report["decision"]["outcome"], "warn")
+            self.assertEqual(report["summary"]["warn_count"], 1)
+            self.assertEqual(report["issues"][0]["enforcement"], "warn")
+
+    def test_policy_rejects_relaxed_complexity_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--complexity-threshold",
+                "11",
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertEqual(report["policy"]["complexity_threshold"], 10)
+            self.assertIn("relax", report["tool_errors"][0]["message"])
+
+    def test_policy_fails_closed_without_complexity_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            rules_dir = workspace / "rules"
+            shutil.copytree(RULES_DIR, rules_dir)
+            (rules_dir / "IMP_007.yml").unlink()
+            target = workspace / "clean.py"
+            target.write_text('APP_NAME = "demo"\n', encoding="utf-8")
+
+            result = self.run_files(
+                workspace,
+                [target],
+                "--rules-dir",
+                str(rules_dir),
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["status"], "error")
+            self.assertEqual(
+                report["policy"]["complexity_threshold_source"],
+                "fallback:DEFAULT_COMPLEXITY_THRESHOLD",
+            )
+
+    def test_yaml_threshold_and_tightening_sources_are_effective(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            rules_dir = workspace / "rules"
+            shutil.copytree(RULES_DIR, rules_dir)
+            complexity_rule = rules_dir / "IMP_007.yml"
+            complexity_rule.write_text(
+                complexity_rule.read_text(encoding="utf-8").replace(
+                    '"threshold": 10', '"threshold": 6'
+                ),
+                encoding="utf-8",
+            )
+            module = load_hook_module()
+            rules = module.load_rules(rules_dir)
+
+            yaml_args = module.parse_args(["--files"])
+            cli_args = module.parse_args(["--complexity-threshold", "4", "--files"])
+            yaml_request, _ = module.build_quality_gate_request(yaml_args, None, workspace)
+            cli_request, _ = module.build_quality_gate_request(cli_args, None, workspace)
+            with mock.patch.dict(
+                os.environ, {"VCG_COMPLEXITY_THRESHOLD": "3"}, clear=False
+            ):
+                env_args = module.parse_args(["--files"])
+                env_request, _ = module.build_quality_gate_request(
+                    env_args, None, workspace
+                )
+
+            yaml_policy, yaml_errors = module.effective_policy(yaml_request, rules)
+            cli_policy, cli_errors = module.effective_policy(cli_request, rules)
+            env_policy, env_errors = module.effective_policy(env_request, rules)
+
+            self.assertEqual(yaml_errors + cli_errors + env_errors, [])
+            self.assertEqual(yaml_policy["complexity_threshold"], 6)
+            self.assertEqual(cli_policy["complexity_threshold"], 4)
+            self.assertEqual(cli_policy["complexity_threshold_source"], "cli")
+            self.assertEqual(env_policy["complexity_threshold"], 3)
+            self.assertIn("environment", env_policy["complexity_threshold_source"])
+
+    def test_mixed_enforcement_uses_strongest_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            target = workspace / "mixed.py"
+            target.write_text(
+                'API_URL = "http://localhost:3000/v1"\n'
+                "def retry(value):\n    return value > 3\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_files(
+                workspace,
+                [target],
+                env={"PATH": "/nonexistent"},
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["decision"]["outcome"], "block")
+            self.assertGreaterEqual(report["summary"]["block_count"], 1)
+            self.assertGreaterEqual(report["summary"]["warn_count"], 1)
 
     def test_public_python_api_without_docstring_reports_documentation_issue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -452,11 +578,13 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertEqual(result.returncode, 0, result.stdout)
             payload = json.loads(result.stdout)
             doc_issues = [issue for issue in payload["issues"] if issue["rule_id"] == "MNT_002"]
             self.assertEqual(len(doc_issues), 1)
             self.assertEqual(doc_issues[0]["file_path"], "api.py")
+            self.assertEqual(doc_issues[0]["enforcement"], "observe")
+            self.assertEqual(payload["decision"]["outcome"], "observe")
             self.assertIn("public_api", doc_issues[0]["message"])
 
     def test_private_python_helper_without_docstring_passes_documentation_gate(self) -> None:
@@ -507,10 +635,12 @@ class PostToolUseQualityGateTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertEqual(result.returncode, 0, result.stdout)
             payload = json.loads(result.stdout)
             design_issues = [issue for issue in payload["issues"] if issue["rule_id"] == "DSN_001"]
             self.assertEqual(len(design_issues), 1)
+            self.assertEqual(design_issues[0]["enforcement"], "observe")
+            self.assertEqual(payload["decision"]["outcome"], "observe")
             self.assertIn("get_user", design_issues[0]["message"])
 
     def test_python_method_with_boundary_logic_is_not_pass_through(self) -> None:
@@ -560,7 +690,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
 
             result = self.run_hook(workspace, payload)
 
-            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("MNT_001", result.stderr)
             self.assertIn("settings.py", result.stderr)
 
@@ -581,7 +711,7 @@ class PostToolUseQualityGateTests(unittest.TestCase):
 
             result = self.run_hook(workspace, payload)
 
-            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("MNT_001", result.stderr)
             self.assertIn("settings.py", result.stderr)
 

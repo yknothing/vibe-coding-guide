@@ -8,5 +8,5 @@ met: {"type": "code_config_separation", "expr": {"configuration_values_hardcoded
 det: [{"tool": "sg", "rule": "hardcoded_ip_port_or_url_patterns"}, {"tool": "sa", "rule": "endpoint_literal_scan"}]
 act: "RCM"
 autofix: {"type": "manual_assist"}
-gate: {"detector": "hardcoded_endpoint_literal", "patterns": ["http_url", "localhost", "ipv4_host"]}
+gate: {"detector": "hardcoded_endpoint_literal", "enforcement": "warn", "patterns": ["http_url", "localhost", "ipv4_host"]}
 rat: "配置硬编码 -> 修改配置需重新编译部署 灵活性差 ; #配置管理 #可维护性"

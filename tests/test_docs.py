@@ -79,6 +79,19 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("`--files`", combined)
         self.assertIn("mutually exclusive", combined)
 
+    def test_docs_explain_policy_decision_contract(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        hook_readme = (ROOT / "hooks" / "README.md").read_text(encoding="utf-8")
+        adapters = (ROOT / "docs" / "ADAPTERS.md").read_text(encoding="utf-8")
+        combined = "\n".join([readme, hook_readme, adapters])
+
+        self.assertIn("gate.enforcement", combined)
+        self.assertIn("decision", combined)
+        self.assertIn("policy", combined)
+        self.assertIn("warn", combined)
+        self.assertIn("observe", combined)
+        self.assertIn("never relax", combined)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,5 +8,5 @@ met: {"type": "magic_value_check", "expr": {"unexplained_literal_found": true, "
 det: [{"tool": "rfk", "rule": "PLR2004"}, {"tool": "esl", "rule": "no-magic-numbers"}, {"tool": "sa", "rule": "numeric_literal_scan"}]
 act: "FIX"
 autofix: {"type": "ai_patch"}
-gate: {"detector": "magic_numeric_literal", "allow_token": "ALLOW_MAGIC_NUMBER:", "ignored_numbers": ["-1", "0", "1", "0.0", "1.0"]}
+gate: {"detector": "magic_numeric_literal", "enforcement": "block", "allow_token": "ALLOW_MAGIC_NUMBER:", "ignored_numbers": ["-1", "0", "1", "0.0", "1.0"]}
 rat: "魔法值硬编码 -> 代码晦涩难懂 维护时易引入新错误 配置管理困难 ; #可读性 #可维护性"

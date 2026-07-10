@@ -163,6 +163,7 @@ class Issue:
     message: str
     detailed_explanation: str
     suggested_action: str
+    enforcement: str = "block"
     metric_values: dict[str, Any] | None = None
     code_snippet: str | None = None
 
@@ -177,6 +178,7 @@ class Issue:
             "message": self.message,
             "detailed_explanation": self.detailed_explanation,
             "suggested_action": self.suggested_action,
+            "enforcement": self.enforcement,
             "rule_version": RULE_VERSION,
             "scan_timestamp": dt.datetime.now(dt.timezone.utc)
             .isoformat()
@@ -243,7 +245,8 @@ class QualityGateRequest:
     tool_name: str | None
     baseline_path: Path | None
     strict: bool
-    complexity_threshold: int
+    complexity_threshold: int | None
+    complexity_threshold_source: str | None
 
     def source_schema(self) -> dict[str, Any]:
         return {
@@ -283,7 +286,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--complexity-threshold",
         type=int,
-        default=int(os.environ.get("VCG_COMPLEXITY_THRESHOLD", DEFAULT_COMPLEXITY_THRESHOLD)),
+        default=None,
         help="Maximum allowed cyclomatic complexity per function.",
     )
     parser.add_argument(
@@ -345,6 +348,7 @@ def apply_rule_metadata(issues: list[Issue], rules: dict[str, Rule]) -> list[Iss
                 message=issue.message,
                 detailed_explanation=rule.rat,
                 suggested_action=rule.act,
+                enforcement=str(rule.gate["enforcement"]),
                 metric_values=issue.metric_values,
                 code_snippet=issue.code_snippet,
             )
@@ -452,6 +456,21 @@ def build_quality_gate_request(
         if args.files is None:
             errors.append(ToolError("hook-input", "No --files provided and --hook was not set."))
 
+    threshold = args.complexity_threshold
+    threshold_source = "cli" if threshold is not None else None
+    env_threshold = os.environ.get("VCG_COMPLEXITY_THRESHOLD")
+    if threshold is None and env_threshold is not None:
+        try:
+            threshold = int(env_threshold)
+            threshold_source = "environment:VCG_COMPLEXITY_THRESHOLD"
+        except ValueError:
+            errors.append(
+                ToolError(
+                    "rule-config",
+                    "VCG_COMPLEXITY_THRESHOLD must be an integer.",
+                )
+            )
+
     request = QualityGateRequest(
         schema_version=REQUEST_SCHEMA_VERSION,
         root=root,
@@ -462,9 +481,52 @@ def build_quality_gate_request(
         tool_name=tool_name,
         baseline_path=request_baseline_path(args.ratchet_baseline, root),
         strict=args.require_tools,
-        complexity_threshold=args.complexity_threshold,
+        complexity_threshold=threshold,
+        complexity_threshold_source=threshold_source,
     )
     return request, errors
+
+
+def effective_policy(
+    request: QualityGateRequest, rules: dict[str, Rule]
+) -> tuple[dict[str, Any], list[ToolError]]:
+    errors: list[ToolError] = []
+    complexity_rule = rules.get("IMP_007")
+    baseline = DEFAULT_COMPLEXITY_THRESHOLD
+    source = "fallback:DEFAULT_COMPLEXITY_THRESHOLD"
+    if complexity_rule and complexity_rule.gate:
+        configured = complexity_rule.gate.get("threshold")
+        if isinstance(configured, int) and not isinstance(configured, bool):
+            baseline = configured
+            source = "rules:IMP_007.gate.threshold"
+    else:
+        errors.append(
+            ToolError(
+                "rule-config",
+                "Effective policy requires rules/IMP_007.yml with gate.threshold.",
+            )
+        )
+
+    requested = request.complexity_threshold
+    effective = baseline
+    if requested is not None:
+        if requested <= 0:
+            errors.append(ToolError("rule-config", "Complexity threshold must be positive."))
+        elif requested > baseline:
+            errors.append(
+                ToolError(
+                    "rule-config",
+                    f"Complexity threshold {requested} would relax the rules baseline {baseline}.",
+                )
+            )
+        else:
+            effective = requested
+            source = request.complexity_threshold_source or "request"
+    return {
+        "complexity_threshold": effective,
+        "complexity_threshold_source": source,
+        "complexity_threshold_baseline": baseline,
+    }, errors
 
 
 def collect_path_values(value: Any, key_hint: str = "") -> list[str]:
@@ -1991,6 +2053,7 @@ def render_feedback(
     files: list[Path],
     ratchet: dict[str, Any],
     max_issues: int,
+    decision_outcome: str,
 ) -> str:
     lines: list[str] = []
     if tool_errors:
@@ -2022,9 +2085,14 @@ def render_feedback(
         for skipped in skipped_files[:max_issues]:
             lines.append(f"- {skipped.path or '<empty>'}: {skipped.reason}")
     if issues or ratchet_violations:
+        disposition = (
+            "Fix the blocking findings before continuing."
+            if decision_outcome == "block"
+            else "These findings are non-blocking; keep them visible for follow-up."
+        )
         lines.append(
-            "Fix the reported literals/complexity before continuing, or add a narrow "
-            "ALLOW_MAGIC_NUMBER: reason, ticket comment for an intentional magic literal."
+            f"{disposition} Intentional magic literals still require a narrow "
+            "ALLOW_MAGIC_NUMBER: reason, ticket comment."
         )
     return "\n".join(lines)
 
@@ -2042,18 +2110,15 @@ def build_report(
     started_at: float,
     source: dict[str, Any],
     detectors: dict[str, dict[str, Any]],
+    decision: dict[str, Any],
+    policy: dict[str, Any],
 ) -> dict[str, Any]:
     ratchet_violations = ratchet.get("violations", [])
-    no_scanned_files = not files and not issues and not tool_errors and not ratchet_violations
-    status = (
-        "error"
-        if tool_errors
-        else "fail"
-        if issues or ratchet_violations
-        else "incomplete"
-        if no_scanned_files
-        else "pass"
-    )
+    status = {
+        "error": "error",
+        "block": "fail",
+        "incomplete": "incomplete",
+    }.get(decision["outcome"], "pass")
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
         "gate": "post_tool_use_quality_gate",
@@ -2064,6 +2129,8 @@ def build_report(
         "duration_ms": int((time.monotonic() - started_at) * MILLISECONDS_PER_SECOND),
         "root": root.as_posix(),
         "source": source,
+        "decision": decision,
+        "policy": policy,
         "detectors": detectors,
         "scanned_files": [relative_path(path, root) for path in files],
         "skipped_files": [dataclasses.asdict(skipped) for skipped in skipped_files],
@@ -2078,7 +2145,40 @@ def build_report(
             "ratchet_violation_count": len(ratchet_violations),
             "scanned_file_count": len(files),
             "skipped_file_count": len(skipped_files),
+            **decision["enforcement_counts"],
         },
+    }
+
+
+def build_decision(
+    issues: list[Issue],
+    tool_errors: list[ToolError],
+    files: list[Path],
+    ratchet: dict[str, Any],
+) -> dict[str, Any]:
+    counts = {"block_count": 0, "warn_count": 0, "observe_count": 0}
+    rule_ids: dict[str, set[str]] = {"block": set(), "warn": set(), "observe": set()}
+    for issue in issues:
+        key = f"{issue.enforcement}_count"
+        counts[key] += 1
+        rule_ids[issue.enforcement].add(issue.rule_id)
+
+    if tool_errors:
+        outcome = "error"
+    elif not files and not issues and not ratchet.get("violations"):
+        outcome = "incomplete"
+    elif ratchet.get("violations") or counts["block_count"]:
+        outcome = "block"
+    elif counts["warn_count"]:
+        outcome = "warn"
+    elif counts["observe_count"]:
+        outcome = "observe"
+    else:
+        outcome = "pass"
+    return {
+        "outcome": outcome,
+        "enforcement_counts": counts,
+        "rule_ids": {key: sorted(value) for key, value in rule_ids.items()},
     }
 
 
@@ -2108,6 +2208,8 @@ def main(argv: list[str]) -> int:
         rules = load_rules(Path(args.rules_dir))
     except RuleValidationError as exc:
         rule_errors.append(ToolError("rule-config", str(exc)))
+    policy, policy_errors = effective_policy(request, rules)
+    rule_errors.extend(policy_errors)
 
     files, skipped_files = resolve_scan_files(list(request.files), root)
 
@@ -2115,7 +2217,7 @@ def main(argv: list[str]) -> int:
     ratchet, ratchet_errors = evaluate_ratchet(metrics, request.baseline_path)
     detectors = detector_inventory()
     issues, tool_errors, detector_outcomes = scan_files(
-        files, root, request.complexity_threshold, request.strict
+        files, root, policy["complexity_threshold"], request.strict
     )
     for detector, outcome in detector_outcomes.items():
         detectors[detector]["run"] = outcome.to_schema()
@@ -2134,6 +2236,7 @@ def main(argv: list[str]) -> int:
         issues = apply_rule_metadata(issues, rules)
 
     source = report_source(request)
+    decision = build_decision(issues, all_errors, files, ratchet)
     report = build_report(
         issues,
         all_errors,
@@ -2147,6 +2250,8 @@ def main(argv: list[str]) -> int:
         started_at,
         source,
         detectors,
+        decision,
+        policy,
     )
 
     if args.format == "json":
@@ -2157,13 +2262,21 @@ def main(argv: list[str]) -> int:
                 indent=JSON_INDENT,
             )
         )
-    elif report["status"] != "pass":
+    elif decision["outcome"] != "pass":
         print(
-            render_feedback(issues, all_errors, skipped_files, files, ratchet, args.max_issues),
+            render_feedback(
+                issues,
+                all_errors,
+                skipped_files,
+                files,
+                ratchet,
+                args.max_issues,
+                decision["outcome"],
+            ),
             file=sys.stderr,
         )
 
-    if report["status"] != "pass":
+    if decision["outcome"] in {"error", "block", "incomplete"}:
         return 2 if args.hook else 1
     return 0
 
