@@ -5,10 +5,93 @@
 > 本仓库正在从"给 AI 读的规则库"（v1，已被实践证伪）重构为**Agent 编码质量门禁套件与编译方法论**。
 > 转向的完整论证见 [docs/STRATEGY.md](./docs/STRATEGY.md)。
 
+## 10 分钟跑通
+
+本仓库当前最重要的使用路径是 **IDE-neutral quality gate core**：同一套检测逻辑先通过
+Generic CLI 跑通，再由各 IDE/CLI 的薄 adapter 接入。Claude Code 已有 documented
+`PostToolUse` 路径；Codex、Cursor、Qoder、Trae、Droid 目前使用 Generic CLI fallback，
+native adapter 仍是 planned。adapter 能力、状态分级和输入/输出契约见
+[docs/ADAPTERS.md](./docs/ADAPTERS.md)。
+
+先检查本机能不能启用严格门禁：
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile python --require-tools
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile all --require-tools
+```
+
+Doctor 默认检查 `all`，也可选择 `python`、`javascript` 或 `typescript`。它会运行并自动清理
+clean 与已知违规 canary；只有 Python 3.11+、完整核心规则、所选 detector、clean pass，以及
+canary 同时触发 `IMP_004`/`IMP_007` 时，`strict_ready` 才为 `true`。版本命令成功不等于
+profile 可用。Doctor 自身不安装或下载依赖，但 detector 及其项目配置不受网络沙箱隔离。
+`javascript` 会覆盖 `.js/.jsx/.mjs/.cjs`，`typescript` 会覆盖 `.ts/.tsx`；monorepo 应以
+每个 package 为 `--root` 分别运行，不能用一个目录的 smoke 代表所有 package。
+若 TypeScript config 只覆盖特定目录，使用
+`--doctor --profile typescript --probe-dir src --require-tools` 明确指定。JSON 的
+`adapter_launch.generic_cli_argv/claude_hook_argv/environment` 固定本次验证的 project root、rules directory、Python 和 detector 绝对路径，IDE/CLI adapter
+应消费它们；ESLint 的绝对 Node runtime 也通过 `VCG_NODE_BIN` 固定。生成的命令携带
+`--scan-profile`，收到 doctor 未验收语言的文件会在 detector 执行前 fail closed，避免 GUI 环境与终端 `PATH`
+不一致或运行范围扩大。
+实际 scan 的 `--require-tools` 同样是 profile-scoped：Python-only scan 不要求 ESLint，
+但仍要求 Ruff 和 lizard。
+
+如果缺 detector，安装当前 strict mode 依赖：
+
+| Tool | What it is | Gate role |
+|---|---|---|
+| `ruff` | Fast Python linter | Python 魔法数字检测，使用 Ruff `PLR2004` 补强内置 AST fallback。 |
+| `lizard` | Cyclomatic complexity analyzer | 函数圈复杂度检测，用于 `IMP_007`。 |
+| `Node.js` | JavaScript runtime | 运行 ESLint；doctor 会固定绝对路径到 `VCG_NODE_BIN`。 |
+| `eslint` | JavaScript and TypeScript linter | JS 魔法数字检测；TypeScript 还要求可工作的 parser/config。被 ESLint 忽略的 TS 文件会 fail closed。 |
+| `typescript-eslint` | Project-local TypeScript tooling | 为 `.ts`/`.tsx` 提供 parser 和 flat config；只做 JavaScript 时不需要。 |
+
+```bash
+python3 -m pip install --upgrade ruff lizard
+# JavaScript-only standalone path
+npm install -g eslint
+# TypeScript project path (run from a project with package.json)
+npm install --save-dev eslint @eslint/js typescript typescript-eslint
+```
+
+安全边界：这些命令只供人工确认后执行；adapter 或安装器不得静默执行。使用 PyPI/npm、
+组织批准的内部镜像或 pinned/approved toolchain；不要使用 `curl | sh` 式安装脚本；如果不允许
+global npm install，或目标环境不是 macOS/Linux shell，就在项目或受控工具环境中使用等价安装方式。
+Node.js 没有跨平台通用的静默安装命令；使用组织批准的 OS package manager 或受控工具链，并以 `node --version` 验证。
+Python 工具应装在专用 virtual environment、`pipx` 或组织批准的工具环境中；不要污染系统 Python。
+core 只对 ESLint 优先使用 `<project-root>/node_modules/.bin/eslint`，再回退到系统 `PATH`；
+Ruff/lizard 不会从项目 `node_modules/.bin` 执行。TypeScript 项目还需在
+项目根添加匹配 `.ts`/`.tsx` 的 `eslint.config.*`；doctor 会实际扫描临时 `.ts` 文件验证它。
+`eslint.config.*` 是可执行代码，只应在已信任并已评审配置的仓库中运行 doctor 或 strict scan。
+安装后必须重跑：
+
+```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor --profile all --require-tools
+```
+
+再跑最小验证：
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 tools/validate_rules.py rules --require DSN_001 --require IMP_004 --require IMP_007 --require MNT_001 --require MNT_002
+python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.py
+```
+
+JSON report 的 `status` 可能是 `pass`、`fail`、`error` 或 `incomplete`。其中 `incomplete`
+表示没有扫描到支持的文件，不能当作质量绿灯。接入具体 IDE/CLI 前，先用 Generic CLI 跑通；
+再按 [hooks/README.md](./hooks/README.md) 或 [docs/ADAPTERS.md](./docs/ADAPTERS.md) 选择对应 adapter。
+每个 detector 的本次运行真相位于 `detectors.<name>.run`，包括 `status`、`coverage`、
+适用文件、fallback 和 `uncovered_files`。`not_applicable` 与缺工具不同；TypeScript
+ignored/parser/config diagnostic 是 `error`，不能解释为无问题。
+报告中的 `decision` 区分 `block`、`warn` 和 `observe`，每条 issue 都携带
+`enforcement`；`policy` 记录本次有效复杂度阈值及来源。warn/observe 不阻断，但不得被
+adapter 静默丢弃。
+
 ## 实际目录结构（与磁盘一致）
 
 ```text
 docs/
+  ADAPTERS.md                 IDE-neutral core contract、能力矩阵与 adapter 验收边界
   STRATEGY.md                 仓库战略评估：知识注入路线为何失败，为何改走门禁套件
   COMPILING-THE-CLASSICS.md   方法论：六条第一性原理、验证不对称性、六种编译形态
   registry/                   编译登记册（活文档）：逐书逐章把经典编译为可实现的机制
@@ -37,8 +120,9 @@ tools/                        规则加载、校验、APOSD_02a 仪表盘与 APO
 
 ## 可运行门禁原型
 
-当前第一条工程化路径是 `hooks/post_tool_use_quality_gate.py`：一个面向 Claude Code
-`PostToolUse` 的质量门禁原型，覆盖 `Edit` / `Write` / `MultiEdit` 后的改动文件扫描。
+当前第一条工程化路径是 `hooks/post_tool_use_quality_gate.py`：一个 IDE-neutral
+质量门禁 core。它可以直接通过 `--files` 扫描文件，也可以由 Claude Code `PostToolUse`
+或其他 IDE/CLI adapter 转入同一份输入契约。
 
 它目前接线五条规则：
 
@@ -51,6 +135,7 @@ tools/                        规则加载、校验、APOSD_02a 仪表盘与 APO
 运行本地验证：
 
 ```bash
+python3 hooks/post_tool_use_quality_gate.py --doctor --format json
 python3 -m unittest discover -s tests -v
 python3 tools/validate_rules.py rules --require DSN_001 --require IMP_004 --require IMP_007 --require MNT_001 --require MNT_002
 python3 hooks/post_tool_use_quality_gate.py --format json --files path/to/file.py

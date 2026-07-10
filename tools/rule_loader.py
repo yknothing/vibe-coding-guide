@@ -11,12 +11,13 @@ from typing import Any
 
 
 RULE_ID_RE = re.compile(r"^[A-Z]{2,5}_\d{3}$")
-REQUIRED_FIELDS = {"id", "lvl", "sev", "cat", "lang", "state", "met", "det", "act", "rat"}
+REQUIRED_FIELDS = {"id", "lvl", "sev", "cat", "lang", "state", "met", "det", "act", "rat", "gate"}
 ALLOWED_LVL = {"M", "S", "A"}
 ALLOWED_SEV = {"B", "C", "H", "M", "L"}
 ALLOWED_CAT = {"FND", "DSN", "IMP", "SEC", "CNC", "TST", "PRF", "MNT", "CSH", "RSRC"}
 ALLOWED_ACT = {"RQR", "RCM", "FIX", "CNF", "EDU", "LOG", "WARN"}
 ALLOWED_STATE = {"P", "T", "E", "D"}
+ALLOWED_ENFORCEMENT = {"block", "warn", "observe"}
 ALLOWED_DETECTOR_TOOLS = {
     "aih",
     "lzd",
@@ -136,8 +137,16 @@ def validate_rule_data(path: Path, data: dict[str, Any]) -> Rule:
             raise RuleValidationError(f"{path}: `autofix.type` must match issue schema enum")
 
     gate = data.get("gate")
-    if gate is not None and not isinstance(gate, dict):
-        raise RuleValidationError(f"{path}: `gate` must be an object when present")
+    if not isinstance(gate, dict):
+        raise RuleValidationError(f"{path}: `gate` must be an object")
+    if gate.get("enforcement") not in ALLOWED_ENFORCEMENT:
+        raise RuleValidationError(
+            f"{path}: `gate.enforcement` must be one of {', '.join(sorted(ALLOWED_ENFORCEMENT))}"
+        )
+    if rule_id == "IMP_007":
+        threshold = gate.get("threshold")
+        if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+            raise RuleValidationError(f"{path}: `gate.threshold` must be a positive integer")
 
     if " -> " not in rat or " ; #" not in rat:
         raise RuleValidationError(f"{path}: `rat` must use consequence -> impact ; #tag style")
